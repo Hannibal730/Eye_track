@@ -29,7 +29,11 @@ os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 # -------------------- 경로 --------------------
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(HERE, "data")
+MODELS_DIR = os.path.join(HERE, "models")
+VIDEOS_DIR = os.path.join(HERE, "videos")
 os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(MODELS_DIR, exist_ok=True)
+os.makedirs(VIDEOS_DIR, exist_ok=True)
 
 # -------------------- MediaPipe --------------------
 mp_drawing = mp.solutions.drawing_utils
@@ -183,7 +187,7 @@ class Calibrator:
 
     def save_model_pkl(self, path=None):
         if path is None:
-            path = os.path.join(DATA_DIR, "calib_gaze.pkl")
+            path = os.path.join(MODELS_DIR, "calib_gaze.pkl")
         with open(path, "wb") as f:
             pickle.dump({"W": self.model.W, "b": self.model.b, "screen": (self.sw, self.sh)}, f)
 
@@ -658,7 +662,7 @@ class ControlPanel(QtWidgets.QWidget):
 
     def _pick_video(self):
         fname, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Select video", "./videos", "Video files (*.mp4 *.mov *.avi *.mkv);;All files (*)")
+            self, "Select video", VIDEOS_DIR, "Video files (*.mp4 *.mov *.avi *.mkv);;All files (*)")
         if fname:
             with self.shared.lock:
                 self.shared.calib_video_path = fname
@@ -669,7 +673,7 @@ class ControlPanel(QtWidgets.QWidget):
 
     def _choose_and_load_model(self):
         fname, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Select model file", "./models", "Model files (*.npz *.pkl);;All files (*)")
+            self, "Select model file", MODELS_DIR, "Model files (*.npz *.pkl);;All files (*)")
         if fname: self.shared.set_load_model(fname)
 
     def _on_vol_changed(self, v:int):
@@ -794,7 +798,7 @@ class GazeWorker(threading.Thread):
                             connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_iris_connections_style())
 
                     if vis_iris:
-                        cv2.circle(frame_out, (int(icL[0]), int(icL[1])), 3, (0,255,255), -1)  # L: 노랑
+                        cv2.circle(frame_out, (int(icL[0]), int(icL[1])), 3, (255,255,0), -1)  # L: mint
                         cv2.circle(frame_out, (int(icR[0]), int(icR[1])), 3, (255,255,0), -1)  # R: 민트
 
                     # 눈 축(고정 길이)
@@ -963,7 +967,7 @@ def parse_args():
     p.add_argument("--rows", type=int, default=0); p.add_argument("--cols", type=int, default=0)
     p.add_argument("--margin", type=float, default=0.03, help="그리드 외곽 여백(0~0.45)")
     p.add_argument("--per_point", type=float, default=2.0, help="점당 응시 시간(초)")
-    p.add_argument("--camera", type=int, default=0, help="웹캠 인덱스")
+    p.add_argument("--camera", type=int, default=2, help="웹캠 인덱스")
     p.add_argument("--webcam_window", action="store_true", default=True)
     p.add_argument("--no-webcam_window", dest="webcam_window", action="store_false")
     p.add_argument("--mirror_preview", dest="mirror_preview", action="store_true")
@@ -987,7 +991,7 @@ def main():
     panel = ControlPanel(shared)
 
     args = parse_args()
-    # 초기 스무딩 파라미터 동기화
+
     with shared.lock:
         shared.ema_alpha = float(args.ema_a)
         shared.oe_mincutoff = float(args.oe_mincutoff)
