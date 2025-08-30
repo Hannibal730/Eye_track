@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-gaze_overlay_12d.py  (copy에서 '축 부호 안정화'만 비활성화한 버전)
+gaze_overlay_12d.py
 - MediaPipe Face Mesh(iris 포함)로 12D 시선 피처 추출(uL,vL,uR,vR + 2차 확장)
 - 캘리브레이션: 그리드(행x열, 지그재그 순회), 포인트별 체류시간 동안 샘플 수집
 - 데이터 저장: data/gaze_samples_*.npz (X,Y,T,pt_index,screen,feature_names,meta)
@@ -9,7 +9,7 @@ gaze_overlay_12d.py  (copy에서 '축 부호 안정화'만 비활성화한 버�
 - 오버레이: 투명/클릭-스루 빨간 고리
 - 프리뷰: 메쉬/홍채중심/축(u/v 벡터 포함) 시각화 토글 가능
 - 스무딩: OneEuro + EMA(α) 2중 필터 (UI에서 OneEuro/EMA 파라미터 조정 가능)
-- (변경) PCA 축 부호 안정화 호출 제거 → SVD 결과 축 부호를 그대로 사용
+- PCA 축 부호 안정화: 좌우(코쪽 anchor), 상하(+y anchor) 기준으로 축 방향 고정
 
 예)
   python gaze_overlay_12d.py --grid 8x12 --per_point 2.0
@@ -49,9 +49,10 @@ def _unique_idxs(connections):
 LEFT_EYE_IDXS  = _unique_idxs(mp_face_mesh.FACEMESH_LEFT_EYE)
 RIGHT_EYE_IDXS = _unique_idxs(mp_face_mesh.FACEMESH_RIGHT_EYE)
 
-# 눈꼬리/코쪽 코너(부호 정렬용 anchor)  ← 함수는 남겨두되 이번 버전에서는 사용 안 함
+# 눈꼬리/코쪽 코너(부호 정렬용 anchor)
+# 좌안: 바깥 33, 코쪽 133 / 우안: 코쪽 263, 바깥 362
 L_OUTER, L_INNER = 33, 133
-R_INNER, R_OUTER = 263, 362
+R_INNER, R_OUTER = 263, 362  # 순서 주의(코쪽, 바깥)
 
 FEATURE_NAMES = [
     "uL","vL","uR","vR",
@@ -81,19 +82,20 @@ def _iris_center(landmarks, idxs, W, H):
 
 def _align_axes(ax1, ax2, landmarks, side, W, H):
     """
-    (참고용, 이번 버전에서는 호출 안 함)
     PCA 축 부호 정렬:
       - 수평축(ax1): 코쪽(anchor) 방향과 같은 부호가 되도록
       - 수직축(ax2): 화면 아래쪽(+y)과 같은 부호가 되도록
     """
     if side == "L":
-        anchor = _lm_xy(landmarks, L_INNER, W, H) - _lm_xy(landmarks, L_OUTER, W, H)
+        anchor = _lm_xy(landmarks, L_INNER, W, H) - _lm_xy(landmarks, L_OUTER, W, H)  # outer→inner(코쪽)
     else:  # "R"
-        anchor = _lm_xy(landmarks, R_INNER, W, H) - _lm_xy(landmarks, R_OUTER, W, H)
+        anchor = _lm_xy(landmarks, R_INNER, W, H) - _lm_xy(landmarks, R_OUTER, W, H)  # outer→inner(코쪽)
     if np.linalg.norm(anchor) > 1e-6:
         anchor = anchor / np.linalg.norm(anchor)
+    # 수평축 정렬(코쪽과 같은 방향)
     if float(np.dot(ax1, anchor)) < 0.0:
         ax1 = -ax1
+    # 수직축 정렬(+y로 향하도록)
     down = np.array([0.0, 1.0], dtype=np.float32)
     if float(np.dot(ax2, down)) < 0.0:
         ax2 = -ax2
@@ -108,8 +110,8 @@ def _eye_uv_ex(landmarks, eye_idxs, iris_idxs, side, W, H):
     """
     eye_pts = np.array([(landmarks[i].x * W, landmarks[i].y * H) for i in eye_idxs], dtype=np.float32)
     c, ax1, ax2, w, h = _pca_axes(eye_pts)
-    # (변경) 축 부호 안정화 비활성화: PCA가 주는 축 부호를 그대로 사용
-    # ax1, ax2 = _align_axes(ax1, ax2, landmarks, side, W, H)
+    # 축 부호 안정화
+    ax1, ax2 = _align_axes(ax1, ax2, landmarks, side, W, H)
 
     ic = _iris_center(landmarks, iris_idxs, W, H)
     delta = ic - c
