@@ -658,7 +658,7 @@ class ControlPanel(QtWidgets.QWidget):
 
     def _pick_video(self):
         fname, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Select video", HERE, "Video files (*.mp4 *.mov *.avi *.mkv);;All files (*)")
+            self, "Select video", "./videos", "Video files (*.mp4 *.mov *.avi *.mkv);;All files (*)")
         if fname:
             with self.shared.lock:
                 self.shared.calib_video_path = fname
