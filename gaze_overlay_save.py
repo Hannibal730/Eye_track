@@ -361,10 +361,21 @@ class OverlayWindow(QtWidgets.QWidget):
             tx, ty = self.calib_target
             pen = QtGui.QPen(QtGui.QColor(255,165,0,240), 4); p.setPen(pen)
             p.setBrush(QtCore.Qt.NoBrush); p.drawEllipse(QtCore.QPointF(tx, ty), 16, 16)
+        # if self.cross is not None:
+        #     x, y = self.cross
+        #     pen = QtGui.QPen(QtGui.QColor(255,255,0,230), 2); p.setPen(pen)
+        #     size = 16; p.drawLine(x - size, y, x + size, y); p.drawLine(x, y - size, x, y + size)
+        
         if self.cross is not None:
             x, y = self.cross
-            pen = QtGui.QPen(QtGui.QColor(255,255,0,230), 2); p.setPen(pen)
-            size = 16; p.drawLine(x - size, y, x + size, y); p.drawLine(x, y - size, x, y + size)
+            # 빨간색 원형 "고리"
+            pen = QtGui.QPen(QtGui.QColor(255, 0, 0, 230), 4)  # 색/두께
+            p.setPen(pen)
+            p.setBrush(QtCore.Qt.NoBrush)                      # 속이 빈 원
+            radius = 14                                       # 반지름(px) — 취향껏 조절
+            p.drawEllipse(QtCore.QPointF(x, y), radius, radius)        
+                
+        
 
 # ---------- 컨트롤 패널 ----------
 class ControlPanel(QtWidgets.QWidget):
