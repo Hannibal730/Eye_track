@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-gaze_overlay_12d.py  (Calibration 타깃을 동영상으로 표시)
+gaze_overlay_12d.py  (Calibration 타깃 영상 + 오디오 재생)
 - MediaPipe Face Mesh(iris 포함)로 12D 시선 피처 추출(uL,vL,uR,vR + 2차 확장)
 - 캘리브레이션: 그리드(행x열, 지그재그), 포인트당 체류시간 동안 샘플 수집
-- 타깃 표시: (신규) 주황 고리 대신 UFC.mp4 프레임을 해당 포인트 중심에 재생(루프)
-- CUDA(옵션): cv2.cuda 사용 가능 시 업로드/리사이즈를 GPU에서 수행
+- 타깃 표시: UFC.mp4 프레임을 캘리브 포인트 중심에 재생(루프) + (신규) 오디오 재생
+- 오디오 백엔드: python-vlc 우선, 없으면 ffplay 대체
 - 데이터 저장: data/gaze_samples_*.npz (X,Y,T,pt_index,screen,feature_names,meta)
 - 모델: 선형회귀(릿지), .npz/.pkl 로드
 - 스무딩: OneEuro + EMA(α)
@@ -15,7 +15,7 @@ gaze_overlay_12d.py  (Calibration 타깃을 동영상으로 표시)
   python gaze_overlay_12d.py --grid 8x12 --per_point 2.0
 """
 
-import os, sys, time, argparse, re, threading, json
+import os, sys, time, argparse, re, threading, json, subprocess, shutil
 import numpy as np
 import cv2
 import mediapipe as mp
@@ -294,6 +294,97 @@ class VideoSource:
             frame = cv2.resize(frame, (self.out_w, self.out_h), interpolation=cv2.INTER_AREA)
         return True, frame  # BGR, (out_h,out_w,3)
 
+# -------------------- 오디오 매니저 --------------------
+class AudioManager:
+    """
+    - python-vlc(우선) → 이벤트로 무한 루프
+    - 대체: ffplay 서브프로세스, 종료 시 재시작 루프
+    """
+    def __init__(self):
+        self.backend = None
+        self.vlc_mod = None
+        self.vlc_player = None
+        self.ffplay_path = shutil.which("ffplay")
+        # 우선 vlc 시도
+        try:
+            import vlc  # pip install python-vlc, system libvlc 필요
+            self.vlc_mod = vlc
+            self.backend = "vlc"
+        except Exception:
+            self.vlc_mod = None
+            if self.ffplay_path:
+                self.backend = "ffplay"
+            else:
+                self.backend = None
+        self._stop_evt = threading.Event()
+        self.proc = None
+        self.thread = None
+        self.loop = True
+        self.volume = 80
+
+    def start(self, path:str, loop=True, volume=80):
+        self.stop()
+        self.loop = bool(loop)
+        self.volume = int(max(0, min(100, volume)))
+        if self.backend == "vlc":
+            vlc = self.vlc_mod
+            try:
+                inst = vlc.Instance("--no-xlib", "--intf", "dummy", "--no-video")
+                p = inst.media_player_new()
+                m = inst.media_new(path)
+                p.set_media(m)
+                p.audio_set_volume(self.volume)
+                self._stop_evt.clear()
+                def _end(_ev):
+                    if not self._stop_evt.is_set() and self.loop:
+                        try:
+                            p.stop(); p.play()
+                        except Exception:
+                            pass
+                p.event_manager().event_attach(vlc.EventType.MediaPlayerEndReached, _end)
+                p.play()
+                self.vlc_player = p
+            except Exception:
+                self.vlc_player = None
+        elif self.backend == "ffplay":
+            if not self.ffplay_path: return
+            self._stop_evt.clear()
+            def _run():
+                while not self._stop_evt.is_set():
+                    cmd = [self.ffplay_path, "-nodisp", "-autoexit", "-loglevel", "error",
+                           "-volume", str(self.volume), path]
+                    try:
+                        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        self.proc.wait()
+                    except Exception:
+                        break
+                    if not self.loop or self._stop_evt.is_set():
+                        break
+            self.thread = threading.Thread(target=_run, daemon=True); self.thread.start()
+
+    def stop(self):
+        self._stop_evt.set()
+        # VLC
+        if self.vlc_player is not None:
+            try: self.vlc_player.stop()
+            except Exception: pass
+            self.vlc_player = None
+        # ffplay
+        if self.proc is not None:
+            try: self.proc.terminate()
+            except Exception: pass
+            self.proc = None
+        if self.thread is not None:
+            try: self.thread.join(timeout=0.2)
+            except Exception: pass
+            self.thread = None
+
+    def set_volume(self, vol:int):
+        self.volume = int(max(0, min(100, vol)))
+        if self.backend == "vlc" and self.vlc_player is not None:
+            try: self.vlc_player.audio_set_volume(self.volume)
+            except Exception: pass
+
 # -------------------- 공유 상태 --------------------
 class SharedState:
     def __init__(self, sw:int, sh:int):
@@ -327,12 +418,17 @@ class SharedState:
         self.oe_beta = 0.003
         self.oe_dcutoff = 1.0
 
-        # (신규) 캘리브 타깃으로 동영상 사용
+        # 캘리브 타깃 비디오
         self.use_video_target = True
-        self.calib_video_path = os.path.join(HERE, "UFC.mp4")
+        self.calib_video_path = False
         self.video_frame = None     # BGR np.ndarray (작게 리사이즈)
         self.video_size = (320, 180)
         self.cuda_enabled = (hasattr(cv2, "cuda") and cv2.cuda.getCudaEnabledDeviceCount() > 0)
+
+        # 오디오
+        self.audio_enabled = True
+        self.audio_volume = 80
+        self.audio_backend = "auto"
 
         # 명령 플래그 / 모델 로드 경로
         self.cmd = {
@@ -392,14 +488,8 @@ class OverlayWindow(QtWidgets.QWidget):
             fs = self.shared.fullscreen
             self.status = self.shared.status
             self.substatus = self.shared.substatus
-
-            # 비디오 프레임 캐시 갱신
             vf = self.shared.video_frame
-            vsz = self.shared.video_size
-        if vf is not None:
-            self._vid_img = self._bgr_to_qimage(vf)
-        else:
-            self._vid_img = None
+        self._vid_img = self._bgr_to_qimage(vf) if vf is not None else None
 
         if enabled:
             if not self.isVisible(): self.setAttribute(QtCore.Qt.WA_ShowWithoutActivating, True); self.show()
@@ -423,7 +513,7 @@ class OverlayWindow(QtWidgets.QWidget):
         pen = QtGui.QPen(QtGui.QColor(160,160,160,200), 1); p.setPen(pen)
         p.setFont(QtGui.QFont("Arial", 12)); p.drawText(30, 80, self.substatus)
 
-        # 캘리브 타깃: (신규) 동영상 프레임을 해당 포인트 중심에 그리기
+        # 캘리브 타깃: 동영상 프레임
         if self.calib_target is not None:
             tx, ty = self.calib_target
             if self._vid_img is not None:
@@ -431,7 +521,6 @@ class OverlayWindow(QtWidgets.QWidget):
                 x1 = int(tx - w/2); y1 = int(ty - h/2)
                 p.drawImage(QtCore.QPoint(x1, y1), self._vid_img)
             else:
-                # 비디오 사용 불가 시 기존 주황 고리 fallback
                 pen = QtGui.QPen(QtGui.QColor(255,165,0,240), 4); p.setPen(pen)
                 p.setBrush(QtCore.Qt.NoBrush); p.drawEllipse(QtCore.QPointF(tx, ty), 16, 16)
 
@@ -450,7 +539,7 @@ class ControlPanel(QtWidgets.QWidget):
         self.shared = shared
         self.setWindowTitle("Gaze Control")
         self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
-        self.setFixedWidth(520)
+        self.setFixedWidth(560)
 
         v = QtWidgets.QVBoxLayout(self)
         self.lbl = QtWidgets.QLabel("Ready"); v.addWidget(self.lbl)
@@ -471,13 +560,14 @@ class ControlPanel(QtWidgets.QWidget):
         b_fs.clicked.connect(lambda: self.shared.set_cmd("toggle_fullscreen"))
         b_quit.clicked.connect(lambda: self.shared.set_cmd("quit"))
 
-        # (신규) 캘리브 타깃 비디오 설정
+        # 캘리브 타깃 비디오
         grpV = QtWidgets.QGroupBox("Calibration target (video)"); v.addWidget(grpV)
         gv = QtWidgets.QGridLayout(grpV)
-        self.cb_usevid = QtWidgets.QCheckBox("Use video target (UFC.mp4)"); self.cb_usevid.setChecked(True)
+        self.cb_usevid = QtWidgets.QCheckBox("Use video target"); self.cb_usevid.setChecked(True)
         self.btn_pick  = QtWidgets.QPushButton("Pick video...")
         self.sb_width  = QtWidgets.QSpinBox(); self.sb_width.setRange(80, 1280); self.sb_width.setSingleStep(10); self.sb_width.setValue(320)
-        self.cb_cuda   = QtWidgets.QCheckBox("Use CUDA if available"); self.cb_cuda.setChecked(self.shared.cuda_enabled)
+        self.cb_cuda   = QtWidgets.QCheckBox("Use CUDA if available")
+        self.cb_cuda.setChecked(self.shared.cuda_enabled)
         gv.addWidget(self.cb_usevid, 0,0,1,2)
         gv.addWidget(QtWidgets.QLabel("Video width (px)"), 1,0); gv.addWidget(self.sb_width, 1,1)
         gv.addWidget(self.cb_cuda, 2,0,1,2)
@@ -487,6 +577,20 @@ class ControlPanel(QtWidgets.QWidget):
         self.cb_cuda.toggled.connect(lambda v_: self._set("cuda_enabled", bool(v_)))
         self.sb_width.valueChanged.connect(lambda val: self._set_video_width(int(val)))
         self.btn_pick.clicked.connect(self._pick_video)
+
+        # 오디오
+        grpA = QtWidgets.QGroupBox("Audio"); v.addWidget(grpA)
+        ga = QtWidgets.QGridLayout(grpA)
+        self.cb_audio = QtWidgets.QCheckBox("Play audio during calibration"); self.cb_audio.setChecked(True)
+        self.sl_vol   = QtWidgets.QSlider(QtCore.Qt.Horizontal); self.sl_vol.setRange(0,100); self.sl_vol.setValue(80)
+        self.lbl_vol  = QtWidgets.QLabel("80")
+        self.lbl_backend = QtWidgets.QLabel("(backend: auto)")
+        ga.addWidget(self.cb_audio,   0,0,1,2)
+        ga.addWidget(QtWidgets.QLabel("Volume"), 1,0); ga.addWidget(self.sl_vol, 1,1); ga.addWidget(self.lbl_vol, 1,2)
+        ga.addWidget(self.lbl_backend, 2,0,1,3)
+
+        self.cb_audio.toggled.connect(lambda v_: self._set("audio_enabled", bool(v_)))
+        self.sl_vol.valueChanged.connect(self._on_vol_changed)
 
         # 시각화 옵션
         grp = QtWidgets.QGroupBox("Visualization"); v.addWidget(grp)
@@ -561,15 +665,21 @@ class ControlPanel(QtWidgets.QWidget):
 
     def _set_video_width(self, w:int):
         with self.shared.lock:
-            self.shared.video_size = (int(w), max(60, int(w*9/16)))  # 대충 16:9 비율 가정
+            self.shared.video_size = (int(w), max(60, int(w*9/16)))  # 대략 16:9
 
     def _choose_and_load_model(self):
         fname, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Select model file", DATA_DIR, "Model files (*.npz *.pkl);;All files (*)")
         if fname: self.shared.set_load_model(fname)
 
+    def _on_vol_changed(self, v:int):
+        self.lbl_vol.setText(str(int(v)))
+        with self.shared.lock:
+            self.shared.audio_volume = int(v)
+
     def tick(self):
-        with self.shared.lock: txt = self.shared.status
+        with self.shared.lock:
+            txt = self.shared.status
         self.lbl.setText(txt)
 
 # -------------------- 워커 --------------------
@@ -581,6 +691,10 @@ class GazeWorker(threading.Thread):
         self.oe = OneEuro(mincutoff=0.20, beta=0.003, dcutoff=1.0)
         self.ema_last = None
         self.vid = None
+        self.audio = AudioManager()
+        # 패널에 백엔드 표시를 위해 저장
+        with self.shared.lock:
+            self.shared.audio_backend = self.audio.backend or "none"
 
     def _ensure_video(self):
         with self.shared.lock:
@@ -623,6 +737,8 @@ class GazeWorker(threading.Thread):
         with mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True,
                                    min_detection_confidence=0.5, min_tracking_confidence=0.5) as face_mesh:
 
+            was_collecting = False
+
             while not self.stop_flag.is_set():
                 # 옵션 스냅샷
                 with self.shared.lock:
@@ -636,12 +752,15 @@ class GazeWorker(threading.Thread):
                     uv_gain = float(self.shared.uv_bigger_gain)
 
                     ema_a = float(self.shared.ema_alpha)
-                    # OneEuro 파라미터 주입
+                    # OneEuro 파라미터
                     self.oe.mincutoff = float(self.shared.oe_mincutoff)
                     self.oe.beta      = float(self.shared.oe_beta)
                     self.oe.dcutoff   = float(self.shared.oe_dcutoff)
 
                     use_video = bool(self.shared.use_video_target)
+                    audio_enabled = bool(self.shared.audio_enabled)
+                    audio_volume  = int(self.shared.audio_volume)
+                    vpath         = self.shared.calib_video_path
 
                 ok, frame = cap.read()
                 if not ok: continue
@@ -720,20 +839,18 @@ class GazeWorker(threading.Thread):
                                 cv2.arrowedLine(frame_out, base, (base[0]+int(big_v[0]), base[1]+int(big_v[1])),
                                                 (0,255,255), 3, tipLength=0.25)
 
-                # ---- 비디오 업데이트(캘리브 중일 때 주기적으로 프레임 갱신) ----
-                if use_video and self.vid is None:
+                # ---- 비디오 업데이트(캘리브 중일 때 프레임 갱신) ----
+                with self.shared.lock:
+                    want_video = bool(self.shared.use_video_target)
+                if want_video and self.vid is None:
                     self._ensure_video()
-                if use_video and self.vid is not None:
+                if want_video and self.vid is not None:
                     okv, vframe = self.vid.read()
-                    if okv:
-                        with self.shared.lock:
-                            self.shared.video_frame = vframe  # BGR (작게)
-                    else:
-                        with self.shared.lock:
-                            self.shared.video_frame = None
+                    with self.shared.lock:
+                        self.shared.video_frame = (vframe if okv else None)
                 else:
                     with self.shared.lock:
-                        self.shared.video_frame = None  # 비활성 시 None
+                        self.shared.video_frame = None
 
                 # ---- 명령 처리 ----
                 if self.shared.pop_cmd("quit"): self.stop_flag.set(); break
@@ -756,6 +873,12 @@ class GazeWorker(threading.Thread):
 
                 # ---- 캘리브/런타임 ----
                 if calib.collecting:
+                    # 오디오: 캘리브 시작 시점 트리거
+                    if not was_collecting:
+                        if audio_enabled and os.path.isfile(vpath):
+                            self.audio.start(vpath, loop=True, volume=audio_volume)
+                        was_collecting = True
+
                     target_px = calib.current_target_px()
                     finished = False
                     if gaze_feat is not None:
@@ -766,31 +889,37 @@ class GazeWorker(threading.Thread):
                         self.shared.status = f"Calibration {calib.idx+1}/{calib.n_points()}"
                         self.shared.substatus = "표시되는 영상 중앙을 응시하세요 (자동 진행)"
                         self.shared.cross = None
-                else:
-                    # 캘리브 종료 직후 저장
-                    if self.shared.calibrating:
+
+                    if finished:
+                        # 종료 처리(모델/데이터 저장 + 오디오 정지)
                         calib.save_model_pkl()
                         ds_path = calib.save_dataset_npz(DATA_DIR, {
                             "grid": self.args.grid, "rows": rows, "cols": cols,
                             "margin": float(self.args.margin), "camera_index": int(self.args.camera),
                             "mirror_preview": bool(self.args.mirror_preview)
                         })
+                        self.audio.stop()
+                        was_collecting = False
                         with self.shared.lock:
                             self.shared.calibrating = False
                             self.shared.calib_target = None
                             self.shared.status = "Calibrated & saved data"
                             self.shared.substatus = f"Saved: {os.path.basename(ds_path)}"
+                else:
+                    # 러닝 모드
+                    if was_collecting:
+                        self.audio.stop()
+                        was_collecting = False
 
                     px = None
                     if (gaze_feat is not None) and calib.has_model():
                         pred = np.array(calib.predict(gaze_feat), dtype=np.float32)
-                        # 1) OneEuro (파라미터는 위에서 최신화됨)
+                        # 1) OneEuro
                         oe = self.oe.filter(pred, t=time.time())
                         # 2) EMA
                         if self.ema_last is None: self.ema_last = oe.copy()
                         else:
-                            a = ema_a
-                            self.ema_last = a*self.ema_last + (1.0-a)*oe
+                            self.ema_last = ema_a*self.ema_last + (1.0-ema_a)*oe
                         sm = self.ema_last
                         px = (int(sm[0]), int(sm[1]))
                     with self.shared.lock:
@@ -822,12 +951,14 @@ class GazeWorker(threading.Thread):
                 else:
                     time.sleep(0.001)
 
+        self.audio.stop()
         cap.release(); cv2.destroyAllWindows()
+
     def stop(self): self.stop_flag.set()
 
 # -------------------- 인자 --------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="MediaPipe FaceMesh + PyQt click-through gaze overlay (12D) + video target")
+    p = argparse.ArgumentParser(description="MediaPipe FaceMesh + PyQt click-through gaze overlay (12D) + video+audio target")
     p.add_argument("--grid", type=str, default="", help="예: '4,8' 또는 '4x8' (없으면 5점)")
     p.add_argument("--rows", type=int, default=0); p.add_argument("--cols", type=int, default=0)
     p.add_argument("--margin", type=float, default=0.03, help="그리드 외곽 여백(0~0.45)")
@@ -838,7 +969,7 @@ def parse_args():
     p.add_argument("--mirror_preview", dest="mirror_preview", action="store_true")
     p.add_argument("--no-mirror_preview", dest="mirror_preview", action="store_false")
     p.set_defaults(mirror_preview=True)
-    # 초기 스무딩 파라미터 (UI에서 실시간 변경 가능)
+    # 초기 스무딩 파라미터
     p.add_argument("--ema_a", type=float, default=0.8, help="EMA alpha (0.7~0.85 권장)")
     p.add_argument("--oe_mincutoff", type=float, default=0.20, help="OneEuro mincutoff")
     p.add_argument("--oe_beta", type=float, default=0.003, help="OneEuro beta")
