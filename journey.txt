@@ -1,0 +1,29 @@
+conda create -n env python 3.11
+pip install --upgrade pip
+pip install -r requirements.txt
+
+sudo apt-get install v4l-utils
+v4l2-ctl --list-devices
+
+
+
+# 1) 16점 캘리브레이션
+python calibrate.py --out /gaze_model.npz --grid 4 --per_point_sec 1.0
+
+# 2) 실시간 시선 표시
+python run_gaze.py --model /gaze_model.npz --oneeuro 1 --min_cutoff 1.2 --beta 0.15 --d_cutoff 1.2
+
+# 3) 시선 옆 카드(HUD) 데모
+python peek_overlay.py --model /gaze_model.npz \
+  --content "Peek HUD 데모\n번역/요약/복사 단축키: [T]/[Y]/[C]" \
+  --min_cutoff 1.2 --beta 0.18 --d_cutoff 1.2
+
+
+python gaze.py --grid 8x10 --per_point 0.6 --margin 0.08 --camera 0
+
+conda install -y -c conda-forge "pyqt=5.*" "qt-main=5.*" pyqt5-sip
+
+
+python gaze_overlay_pyqt.py --grid 4x8 --per_point 0.5 --margin 0.08 --camera 0
+
+조작키: c(캘리브 시작) / l(보정값 로드) / o(오버레이 온오프) / f(오버레이 전체화면 토글) / Esc(종료)
