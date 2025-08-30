@@ -333,29 +333,6 @@ class ControlPanel(QtWidgets.QWidget):
             txt = self.shared.status
         self.lbl.setText(txt)
 
-# ---------- (옵션) 전역 단축키 ----------
-class GlobalHotkeys(threading.Thread):
-    def __init__(self, shared: SharedState):
-        super().__init__(daemon=True); self.shared = shared; self.stop_flag = threading.Event()
-    def run(self):
-        try:
-            from pynput import keyboard
-        except Exception as e:
-            print("[Hotkeys] pynput 미설치 또는 로드 실패:", e); return
-        def on_press(key):
-            try:
-                if key == keyboard.Key.esc: self.shared.set_cmd("quit"); return
-                k = key.char.lower()
-            except AttributeError:
-                return
-            if   k == 'c': self.shared.set_cmd("start_calib")
-            elif k == 'l': self.shared.set_cmd("load_calib")
-            elif k == 'o': self.shared.set_cmd("toggle_overlay")
-            elif k == 'f': self.shared.set_cmd("toggle_fullscreen")
-        with keyboard.Listener(on_press=on_press) as listener:
-            while not self.stop_flag.is_set(): time.sleep(0.05)
-            listener.stop()
-    def stop(self): self.stop_flag.set()
 
 # ---------- 시선 워커 ----------
 class GazeWorker(threading.Thread):
@@ -505,10 +482,8 @@ def parse_args():
     p.add_argument("--no-webcam_window", dest="webcam_window", action="store_false", help="OpenCV 창 끄기")
 
     # ▼ 기본값을 '미러 ON'으로 설정. 필요하면 --no-mirror_preview 로 끌 수 있음.
-    p.add_argument("--mirror_preview", dest="mirror_preview", action="store_true",
-                   help="프리뷰를 셀피(좌우반전)로 표시 (기본 ON)")
-    p.add_argument("--no-mirror_preview", dest="mirror_preview", action="store_false",
-                   help="프리뷰 좌우반전 끄기")
+    p.add_argument("--mirror_preview", dest="mirror_preview", action="store_true", help="프리뷰를 셀피(좌우반전)로 표시 (기본 ON)")
+    p.add_argument("--no-mirror_preview", dest="mirror_preview", action="store_false", help="프리뷰 좌우반전 끄기")
     p.set_defaults(mirror_preview=True)
 
     p.add_argument("--global_hotkeys", action="store_true", help="전역 단축키(pynput 필요)")
