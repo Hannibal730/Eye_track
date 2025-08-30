@@ -1,8 +1,8 @@
 # gaze_overlay_pyqt.py
 # - 투명/클릭스루(PyQt) 오버레이 + 컨트롤 패널
 # - 프리뷰는 기본 '셀피(좌우반전)'로 표시하되, L/R 텍스트는 비반전 상태로 정상 표기
-# - 캘리브 종료 시 data/ 폴더에 학습용 데이터 .npz 자동 저장
-# - "Load Model" 버튼으로 외부 학습 결과(.npz/.pkl; W,b) 로드
+# - 캘리브 종료 시 data/ 폴더에 학습용 데이터 .npz 저장
+# - pkl(선형 모델)도 data/에 저장/로드
 # - Ubuntu 22.04 / conda(PyQt5) 권장. Wayland에선 QT_QPA_PLATFORM=xcb 권장.
 
 import os
@@ -17,6 +17,9 @@ from datetime import datetime
 os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
 from PyQt5 import QtCore, QtGui, QtWidgets
+
+# -------------------- 저장 경로 상수 --------------------
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 
 # ---------- MediaPipe aliases ----------
 mp_drawing = mp.solutions.drawing_utils
@@ -161,11 +164,15 @@ class Calibrator:
         y = int(np.clip(y[1], 0, self.sh - 1))
         return x, y
 
-    def save_model_pkl(self, path="calib_gaze.pkl"):
+    def save_model_pkl(self, path=None):
+        # 기본 저장 위치: data/calib_gaze.pkl
+        if path is None:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            path = os.path.join(DATA_DIR, "calib_gaze.pkl")
         with open(path, "wb") as f:
             pickle.dump({"W": self.model.W, "b": self.model.b, "screen": (self.sw, self.sh)}, f)
 
-    def save_dataset_npz(self, out_dir="data", meta_extra=None):
+    def save_dataset_npz(self, out_dir=DATA_DIR, meta_extra=None):
         """
         캘리브로 모은 (X,Y) 샘플을 .npz로 저장. 경로 반환.
         파일: data/gaze_samples_YYYYmmdd_HHMMSS.npz
@@ -296,6 +303,13 @@ class OverlayWindow(QtWidgets.QWidget):
         super().__init__(None)
         self.shared = shared
         self.app = app
+        
+        # ▼ 기본 상태 미리 셋업 (paintEvent 첫 호출 안전)
+        self.status = "Gaze Overlay"
+        self.substatus = "Use Control Panel"
+        self.cross = None
+        self.calib_target = None
+        self._last_fullscreen = False
 
         flags = (
             QtCore.Qt.WindowStaysOnTopHint |
@@ -361,21 +375,14 @@ class OverlayWindow(QtWidgets.QWidget):
             tx, ty = self.calib_target
             pen = QtGui.QPen(QtGui.QColor(255,165,0,240), 4); p.setPen(pen)
             p.setBrush(QtCore.Qt.NoBrush); p.drawEllipse(QtCore.QPointF(tx, ty), 16, 16)
-        # if self.cross is not None:
-        #     x, y = self.cross
-        #     pen = QtGui.QPen(QtGui.QColor(255,255,0,230), 2); p.setPen(pen)
-        #     size = 16; p.drawLine(x - size, y, x + size, y); p.drawLine(x, y - size, x, y + size)
-        
         if self.cross is not None:
             x, y = self.cross
             # 빨간색 원형 "고리"
-            pen = QtGui.QPen(QtGui.QColor(255, 0, 0, 230), 4)  # 색/두께
+            pen = QtGui.QPen(QtGui.QColor(255, 0, 0, 230), 4)
             p.setPen(pen)
-            p.setBrush(QtCore.Qt.NoBrush)                      # 속이 빈 원
-            radius = 14                                       # 반지름(px) — 취향껏 조절
-            p.drawEllipse(QtCore.QPointF(x, y), radius, radius)        
-                
-        
+            p.setBrush(QtCore.Qt.NoBrush)
+            radius = 14
+            p.drawEllipse(QtCore.QPointF(x, y), radius, radius)
 
 # ---------- 컨트롤 패널 ----------
 class ControlPanel(QtWidgets.QWidget):
@@ -409,8 +416,9 @@ class ControlPanel(QtWidgets.QWidget):
         self.show()
 
     def _choose_and_load_model(self):
+        os.makedirs(DATA_DIR, exist_ok=True)
         fname, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Select model file", "",
+            self, "Select model file", DATA_DIR,
             "Model files (*.npz *.pkl);;All files (*)"
         )
         if fname:
@@ -520,9 +528,9 @@ class GazeWorker(threading.Thread):
                         self.shared.cross = None
 
                     if finished:
-                        # 1) 선형 모델 백업(pkl)
-                        calib.save_model_pkl("calib_gaze.pkl")
-                        # 2) 데이터셋 저장(npz)
+                        # 1) 선형 모델 백업(pkl) → data/calib_gaze.pkl
+                        calib.save_model_pkl()
+                        # 2) 데이터셋 저장(npz) → data/
                         meta_extra = {
                             "grid": self.args.grid,
                             "rows": rows,
@@ -531,7 +539,7 @@ class GazeWorker(threading.Thread):
                             "camera_index": int(self.args.camera),
                             "mirror_preview": bool(self.args.mirror_preview)
                         }
-                        ds_path = calib.save_dataset_npz(out_dir="data", meta_extra=meta_extra)
+                        ds_path = calib.save_dataset_npz(out_dir=DATA_DIR, meta_extra=meta_extra)
                         print(f"[Data] Saved dataset: {ds_path}")
 
                         with self.shared.lock:
@@ -586,7 +594,7 @@ def parse_args():
     p.add_argument("--grid", type=str, default="", help="예: '4,8' 또는 '4x8' → 4행×8열 그리드. 생략 시 5점")
     p.add_argument("--rows", type=int, default=0, help="--grid 대신 직접 행 지정")
     p.add_argument("--cols", type=int, default=0, help="--grid 대신 직접 열 지정")
-    p.add_argument("--margin", type=float, default=0.10, help="그리드 외곽 여백(0.0~0.45)")
+    p.add_argument("--margin", type=float, default=0.03, help="그리드 외곽 여백(0.0~0.45)")
     p.add_argument("--per_point", type=float, default=0.9, help="점당 응시 시간(초)")
     p.add_argument("--camera", type=int, default=0, help="웹캠 인덱스")
     p.add_argument("--webcam_window", action="store_true", default=True, help="(기본) OpenCV 창 사용")

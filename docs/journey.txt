@@ -1,0 +1,14 @@
+conda create -n env python 3.11
+pip install --upgrade pip
+pip install -r requirements.txt
+
+sudo apt-get install v4l-utils
+v4l2-ctl --list-devices
+
+
+conda install -y -c conda-forge "pyqt=5.*" "qt-main=5.*" pyqt5-sip
+
+
+python gaze_overlay_21d.py --grid 15x12 --per_point 3.0
+
+pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu129
