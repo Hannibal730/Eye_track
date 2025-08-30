@@ -1,0 +1,53 @@
+{
+  "source_npz": "gaze_samples_20250830_202307_8x12_2.npz",
+  "num_rows": 4840,
+  "columns": [
+    "uL",
+    "vL",
+    "uR",
+    "vR",
+    "uL2",
+    "vL2",
+    "uR2",
+    "vR2",
+    "uL_vL",
+    "uR_vR",
+    "uL_uR",
+    "vL_vR",
+    "Y_x",
+    "Y_y",
+    "T",
+    "pt_index",
+    "screen_w",
+    "screen_h"
+  ],
+  "feature_names": [
+    "uL",
+    "vL",
+    "uR",
+    "vR",
+    "uL2",
+    "vL2",
+    "uR2",
+    "vR2",
+    "uL_vL",
+    "uR_vR",
+    "uL_uR",
+    "vL_vR"
+  ],
+  "screen": [
+    2560,
+    1600
+  ],
+  "meta": {
+    "rows": 8,
+    "cols": 10,
+    "margin": 0.03,
+    "per_point_sec": 2.0,
+    "n_points": 80,
+    "timestamp": "20250830_202307",
+    "grid": "8x10",
+    "camera_index": 0,
+    "mirror_preview": true
+  }
+}

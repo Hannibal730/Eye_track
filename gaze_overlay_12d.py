@@ -1,7 +1,7 @@
-# gaze_overlay_pyqt.py
+# gaze_overlay_12d.py
 # - 투명/클릭스루(PyQt) 오버레이 + 컨트롤 패널
 # - 프리뷰는 기본 '셀피(좌우반전)'로 표시하되, L/R 텍스트는 비반전 상태로 정상 표기
-# - 캘리브 종료 시 data/ 폴더에 학습용 데이터 .npz 저장
+# - 캘리브 종료 시 data/ 폴더에 학습용 데이터 .npz 저장 (X, Y, T, pt_index 포함)
 # - pkl(선형 모델)도 data/에 저장/로드
 # - Ubuntu 22.04 / conda(PyQt5) 권장. Wayland에선 QT_QPA_PLATFORM=xcb 권장.
 
@@ -128,6 +128,8 @@ class Calibrator:
         self.idx = 0
         self.collecting = False
         self.samples_X, self.samples_Y = [], []
+        # ▼ 추가: 타임스탬프/포인트 인덱스 버퍼
+        self.samples_T, self.samples_IDX = [], []
         self.start_t = None
 
     def n_points(self): return len(self.points_norm)
@@ -141,11 +143,16 @@ class Calibrator:
         self.collecting = True
         self.start_t = time.time()
 
-    def feed(self, feat):
+    def feed(self, feat, t_now=None):
+        """한 프레임 샘플 추가. t_now가 주어지면 그 값을 타임스탬프로 저장."""
         if not self.collecting: return False
         tx, ty = self.current_target_px()
         self.samples_X.append(np.array(feat, dtype=np.float32))
         self.samples_Y.append(np.array([tx, ty], dtype=np.float32))
+        # ▼ 추가: 현재 포인트 인덱스와 시각 저장
+        self.samples_IDX.append(int(self.idx))
+        self.samples_T.append(float(time.time() if t_now is None else t_now))
+
         if (time.time() - self.start_t) >= self.per_point_sec:
             self.idx += 1
             self.start_t = time.time()
@@ -178,6 +185,8 @@ class Calibrator:
         파일: data/gaze_samples_YYYYmmdd_HHMMSS.npz
           - X: float32 [N, D] (D=len(FEATURE_NAMES))
           - Y: float32 [N, 2]  (화면 픽셀)
+          - T: float64 [N]     (수집 시각, 초)
+          - pt_index: int32 [N](샘플이 수집된 캘리브 타깃 인덱스)
           - feature_names: object [D]
           - screen: int32 [2] (w,h)
           - meta: json(str)
@@ -187,6 +196,10 @@ class Calibrator:
         path = os.path.join(out_dir, f"gaze_samples_{ts}.npz")
         X = np.stack(self.samples_X).astype(np.float32)
         Y = np.stack(self.samples_Y).astype(np.float32)
+        # ▼ 추가 저장: T/pt_index
+        T   = np.array(self.samples_T,  dtype=np.float64)
+        IDX = np.array(self.samples_IDX, dtype=np.int32)
+
         meta = {
             "rows": self.rows,
             "cols": self.cols,
@@ -197,7 +210,7 @@ class Calibrator:
         }
         if meta_extra: meta.update(meta_extra)
         np.savez(path,
-                 X=X, Y=Y,
+                 X=X, Y=Y, T=T, pt_index=IDX,
                  feature_names=np.array(FEATURE_NAMES, dtype=object),
                  screen=np.array([self.sw, self.sh], dtype=np.int32),
                  meta=json.dumps(meta))
@@ -518,7 +531,9 @@ class GazeWorker(threading.Thread):
                 if calib.collecting:
                     target_px = calib.current_target_px()
                     finished = False
-                    if gaze_feat is not None: finished = calib.feed(gaze_feat)
+                    if gaze_feat is not None:
+                        # now_t를 넘겨주면 T가 더 정확히 들어간다(선택)
+                        finished = calib.feed(gaze_feat, t_now=time.time())
 
                     with self.shared.lock:
                         self.shared.calibrating = True
@@ -540,7 +555,7 @@ class GazeWorker(threading.Thread):
                             "mirror_preview": bool(self.args.mirror_preview)
                         }
                         ds_path = calib.save_dataset_npz(out_dir=DATA_DIR, meta_extra=meta_extra)
-                        print(f"[Data] Saved dataset: {ds_path}")
+                        print(f".[Data] Saved dataset: {ds_path}")
 
                         with self.shared.lock:
                             self.shared.calibrating = False
@@ -573,6 +588,14 @@ class GazeWorker(threading.Thread):
                     else:
                         cv2.putText(disp, "No face", (10,25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
 
+                    # --- 중앙 정사각형(검정 테두리만) 그리기 ---
+                    s = 150  # 반쪽 길이(px) -> 정사각형 한 변 길이는 2*s
+                    h, w = disp.shape[:2]
+                    x1, y1 = w//2 - s, h//2 - s
+                    x2, y2 = w//2 + s, h//2 + s
+                    cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 0, 0), thickness=2, lineType=cv2.LINE_AA)
+                    cv2.rectangle(disp, (x1, int(y1 + 0.65*s)), (x2, int(y2-1.1*s)), (0, 0, 0), thickness=2, lineType=cv2.LINE_AA)
+
                     cv2.imshow('MediaPipe Face Mesh', disp)
                     # 키 입력은 유지(원하면 여기 삭제 가능)
                     key = cv2.waitKey(1) & 0xFF
@@ -590,7 +613,7 @@ class GazeWorker(threading.Thread):
 
 # ---------- 인자 ----------
 def parse_args():
-    p = argparse.ArgumentParser(description="MediaPipe FaceMesh + PyQt transparent click-through gaze overlay")
+    p = argparse.ArgumentParser(description="MediaPipe FaceMesh + PyQt transparent click-through gaze overlay (12D)")
     p.add_argument("--grid", type=str, default="", help="예: '4,8' 또는 '4x8' → 4행×8열 그리드. 생략 시 5점")
     p.add_argument("--rows", type=int, default=0, help="--grid 대신 직접 행 지정")
     p.add_argument("--cols", type=int, default=0, help="--grid 대신 직접 열 지정")
