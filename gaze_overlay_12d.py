@@ -1,25 +1,35 @@
-# gaze_overlay_12d.py
-# - 투명/클릭스루(PyQt) 오버레이 + 컨트롤 패널
-# - 프리뷰는 기본 '셀피(좌우반전)'로 표시하되, L/R 텍스트는 비반전 상태로 정상 표기
-# - 캘리브 종료 시 data/ 폴더에 학습용 데이터 .npz 저장 (X, Y, T, pt_index 포함)
-# - pkl(선형 모델)도 data/에 저장/로드
-# - Ubuntu 22.04 / conda(PyQt5) 권장. Wayland에선 QT_QPA_PLATFORM=xcb 권장.
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+gaze_overlay_12d.py  (iris center & u/v visualization + per-option toggles)
 
-import os
-import sys, time, argparse, re, threading, json
+- MediaPipe Face Mesh(iris 포함)로 12D 시선 피처 추출(uL,vL,uR,vR + 2차 확장)
+- 캘리브레이션: 그리드(행x열, 지그재그 순회), 포인트별 체류시간 동안 샘플 수집
+- 데이터 저장: data/gaze_samples_*.npz (X,Y,T,pt_index,screen,feature_names,meta)
+- 모델: 내장 선형회귀(.npz/.pkl)
+- 오버레이: 추정점 빨간 고리 (클릭-스루)
+- OpenCV 미리보기: (선택) 메쉬/중앙정사각형/u,v 텍스트/홍채 중심 좌표 시각화
+- 컨트롤 패널: 시각화 옵션을 개별 토글
+
+예)
+  python gaze_overlay_12d.py --grid 8x12 --per_point 2.0
+"""
+
+import os, sys, time, json, threading, argparse, re
 import numpy as np
 import cv2
 import mediapipe as mp
 import pickle
 from datetime import datetime
-
-# X11/xcb 강제(이미 외부에서 설정했다면 그 값을 사용)
-os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
-
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-# -------------------- 저장 경로 상수 --------------------
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+# 환경: xcb 권장
+os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+
+# -------------------- 저장 경로 --------------------
+HERE = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(HERE, "data")
+os.makedirs(DATA_DIR, exist_ok=True)
 
 # ---------- MediaPipe aliases ----------
 mp_drawing = mp.solutions.drawing_utils
@@ -44,7 +54,7 @@ FEATURE_NAMES = [
     "uL_vL","uR_vR","uL_uR","vL_vR"
 ]
 
-# ---------- 수학 유틸 ----------
+# ---------- 수학/좌표 유틸 ----------
 def _pca_axes(pts: np.ndarray):
     c = pts.mean(axis=0)
     X = pts - c
@@ -64,7 +74,7 @@ def _eye_uv(landmarks, eye_idxs, iris_idxs, W, H):
     ic = _iris_center(landmarks, iris_idxs, W, H)
     u = float(np.dot(ic - c, ax1) / (w/2.0))
     v = float(np.dot(ic - c, ax2) / (h/2.0))
-    return (u, v), ic
+    return (u, v), ic  # u/v(정규화), ic(홍채 중심 픽셀 좌표)
 
 def _feat_vector(uL, vL, uR, vR):
     return np.array([
@@ -72,6 +82,22 @@ def _feat_vector(uL, vL, uR, vR):
         uL*uL, vL*vL, uR*uR, vR*vR,
         uL*vL, uR*vR, uL*uR, vL*vR
     ], dtype=np.float32)
+
+# ---------- 캘리브 포인트 ----------
+def make_grid_points(rows:int, cols:int, margin:float=0.10, order:str="serpentine"):
+    rows = max(1, rows); cols = max(1, cols)
+    margin = max(0.0, min(0.45, margin))
+    xs = np.linspace(margin, 1.0 - margin, cols)
+    ys = np.linspace(margin, 1.0 - margin, rows)
+    points = []
+    for r, y in enumerate(ys):
+        row = [(x, y) for x in xs]
+        if order == "serpentine" and (r % 2 == 1):
+            row = row[::-1]
+        points.extend(row)
+    return points
+
+FIVE_POINTS = [(0.5,0.5), (0.15,0.15), (0.85,0.15), (0.85,0.85), (0.15,0.85)]
 
 class Ridge2D:
     def __init__(self, alpha=10.0):
@@ -96,30 +122,11 @@ class Ridge2D:
         X = np.asarray(X, dtype=np.float32)
         return (self.W @ X.T).T + self.b
 
-# ---------- 캘리브 포인트 ----------
-def make_grid_points(rows:int, cols:int, margin:float=0.10, order:str="serpentine"):
-    rows = max(1, rows); cols = max(1, cols)
-    margin = max(0.0, min(0.45, margin))
-    xs = np.linspace(margin, 1.0 - margin, cols)
-    ys = np.linspace(margin, 1.0 - margin, rows)
-    points = []
-    for r, y in enumerate(ys):
-        row = [(x, y) for x in xs]
-        if order == "serpentine" and (r % 2 == 1):
-            row = row[::-1]
-        points.extend(row)
-    return points
-
-FIVE_POINTS = [(0.5,0.5), (0.15,0.15), (0.85,0.15), (0.85,0.85), (0.15,0.85)]
-
 class Calibrator:
     def __init__(self, screen_w, screen_h, rows=0, cols=0, margin=0.10, per_point_sec=0.9):
         self.sw, self.sh = screen_w, screen_h
         self.rows, self.cols, self.margin = rows, cols, margin
-        if rows and cols:
-            self.points_norm = make_grid_points(rows, cols, margin, "serpentine")
-        else:
-            self.points_norm = FIVE_POINTS[:]
+        self.points_norm = make_grid_points(rows, cols, margin, "serpentine") if (rows and cols) else FIVE_POINTS[:]
         self.per_point_sec = per_point_sec
         self.reset()
         self.model = Ridge2D(alpha=10.0)
@@ -128,7 +135,6 @@ class Calibrator:
         self.idx = 0
         self.collecting = False
         self.samples_X, self.samples_Y = [], []
-        # ▼ 추가: 타임스탬프/포인트 인덱스 버퍼
         self.samples_T, self.samples_IDX = [], []
         self.start_t = None
 
@@ -144,12 +150,10 @@ class Calibrator:
         self.start_t = time.time()
 
     def feed(self, feat, t_now=None):
-        """한 프레임 샘플 추가. t_now가 주어지면 그 값을 타임스탬프로 저장."""
         if not self.collecting: return False
         tx, ty = self.current_target_px()
         self.samples_X.append(np.array(feat, dtype=np.float32))
         self.samples_Y.append(np.array([tx, ty], dtype=np.float32))
-        # ▼ 추가: 현재 포인트 인덱스와 시각 저장
         self.samples_IDX.append(int(self.idx))
         self.samples_T.append(float(time.time() if t_now is None else t_now))
 
@@ -157,7 +161,6 @@ class Calibrator:
             self.idx += 1
             self.start_t = time.time()
             if self.idx >= len(self.points_norm):
-                # 학습(선형) + 종료
                 self.model.fit(np.stack(self.samples_X), np.stack(self.samples_Y))
                 self.collecting = False
                 return True
@@ -172,7 +175,6 @@ class Calibrator:
         return x, y
 
     def save_model_pkl(self, path=None):
-        # 기본 저장 위치: data/calib_gaze.pkl
         if path is None:
             os.makedirs(DATA_DIR, exist_ok=True)
             path = os.path.join(DATA_DIR, "calib_gaze.pkl")
@@ -180,23 +182,11 @@ class Calibrator:
             pickle.dump({"W": self.model.W, "b": self.model.b, "screen": (self.sw, self.sh)}, f)
 
     def save_dataset_npz(self, out_dir=DATA_DIR, meta_extra=None):
-        """
-        캘리브로 모은 (X,Y) 샘플을 .npz로 저장. 경로 반환.
-        파일: data/gaze_samples_YYYYmmdd_HHMMSS.npz
-          - X: float32 [N, D] (D=len(FEATURE_NAMES))
-          - Y: float32 [N, 2]  (화면 픽셀)
-          - T: float64 [N]     (수집 시각, 초)
-          - pt_index: int32 [N](샘플이 수집된 캘리브 타깃 인덱스)
-          - feature_names: object [D]
-          - screen: int32 [2] (w,h)
-          - meta: json(str)
-        """
         os.makedirs(out_dir, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = os.path.join(out_dir, f"gaze_samples_{ts}.npz")
         X = np.stack(self.samples_X).astype(np.float32)
         Y = np.stack(self.samples_Y).astype(np.float32)
-        # ▼ 추가 저장: T/pt_index
         T   = np.array(self.samples_T,  dtype=np.float64)
         IDX = np.array(self.samples_IDX, dtype=np.int32)
 
@@ -217,11 +207,6 @@ class Calibrator:
         return path
 
     def load_linear_model(self, path):
-        """
-        외부 학습 결과 로드 (지원 포맷)
-          - .npz : keys 'W','b' (float)
-          - .pkl : dict {'W':..., 'b':...}
-        """
         if path.lower().endswith(".npz"):
             d = np.load(path, allow_pickle=True)
             if "W" in d and "b" in d:
@@ -266,7 +251,7 @@ class OneEuro:
         self.x_prev=x_hat; self.dx_prev=dx_hat; self.t_prev=t
         return x_hat
 
-# ---------- 공유 상태 + 커맨드 ----------
+# ---------- 공유 상태 + 커맨드/옵션 ----------
 class SharedState:
     def __init__(self, sw:int, sh:int):
         self.lock = threading.Lock()
@@ -279,6 +264,15 @@ class SharedState:
         self.fullscreen = False
         self.status = "Gaze Overlay"
         self.substatus = "Use Control Panel"
+
+        # ▼ 시각화 옵션(기본: 기존과 동일하게 ON)
+        self.vis_mesh = True           # 미디어파이프 메쉬
+        self.vis_center_box = True     # 중앙 정사각형
+        self.vis_uv_text = True        # uL/vL/uR/vR 텍스트
+        self.vis_iris = True           # 홍채 중심 점 + 좌표 텍스트
+        self.vis_gaze_ring = True      # 오버레이 빨간 고리
+        self.vis_calib_target = True   # 오버레이 캘리브 타깃
+        self.vis_status_text = True    # 오버레이 상태 텍스트
 
         self.cmd = {
             "start_calib": False,
@@ -316,8 +310,8 @@ class OverlayWindow(QtWidgets.QWidget):
         super().__init__(None)
         self.shared = shared
         self.app = app
-        
-        # ▼ 기본 상태 미리 셋업 (paintEvent 첫 호출 안전)
+
+        # 초기값(첫 페인트 보호)
         self.status = "Gaze Overlay"
         self.substatus = "Use Control Panel"
         self.cross = None
@@ -344,7 +338,6 @@ class OverlayWindow(QtWidgets.QWidget):
         scr = self.app.primaryScreen().geometry()
         self.setGeometry(scr)
 
-        self._last_fullscreen = False
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(16)
@@ -358,7 +351,11 @@ class OverlayWindow(QtWidgets.QWidget):
             fs = self.shared.fullscreen
             self.status = self.shared.status
             self.substatus = self.shared.substatus
+            vis_status = self.shared.vis_status_text
+            vis_calib  = self.shared.vis_calib_target
+            vis_ring   = self.shared.vis_gaze_ring
 
+        # 표시/풀스크린 상태
         if enabled:
             if not self.isVisible():
                 self.setAttribute(QtCore.Qt.WA_ShowWithoutActivating, True)
@@ -374,26 +371,28 @@ class OverlayWindow(QtWidgets.QWidget):
                 self.setWindowState(state & ~QtCore.Qt.WindowFullScreen)
             self._last_fullscreen = fs
 
+        # 페인트 업데이트에 사용될 플래그 저장
+        self._vis_status = vis_status
+        self._vis_calib  = vis_calib
+        self._vis_ring   = vis_ring
+
         if enabled: self.update()
 
     def paintEvent(self, event):
         p = QtGui.QPainter(self); p.setRenderHint(QtGui.QPainter.Antialiasing, True)
-        if self.status:
+        if self._vis_status and self.status:
             pen = QtGui.QPen(QtGui.QColor(200,200,200,230), 2); p.setPen(pen)
             p.setFont(QtGui.QFont("Arial", 18, QtGui.QFont.Bold)); p.drawText(30, 50, self.status)
-        if self.substatus:
             pen = QtGui.QPen(QtGui.QColor(160,160,160,200), 1); p.setPen(pen)
             p.setFont(QtGui.QFont("Arial", 12)); p.drawText(30, 80, self.substatus)
-        if self.calib_target is not None:
+        if self._vis_calib and self.calib_target is not None:
             tx, ty = self.calib_target
             pen = QtGui.QPen(QtGui.QColor(255,165,0,240), 4); p.setPen(pen)
             p.setBrush(QtCore.Qt.NoBrush); p.drawEllipse(QtCore.QPointF(tx, ty), 16, 16)
-        if self.cross is not None:
+        if self._vis_ring and self.cross is not None:
             x, y = self.cross
-            # 빨간색 원형 "고리"
             pen = QtGui.QPen(QtGui.QColor(255, 0, 0, 230), 4)
-            p.setPen(pen)
-            p.setBrush(QtCore.Qt.NoBrush)
+            p.setPen(pen); p.setBrush(QtCore.Qt.NoBrush)
             radius = 14
             p.drawEllipse(QtCore.QPointF(x, y), radius, radius)
 
@@ -404,11 +403,12 @@ class ControlPanel(QtWidgets.QWidget):
         self.shared = shared
         self.setWindowTitle("Gaze Control")
         self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
-        self.setFixedSize(300, 200)
+        self.setFixedWidth(360)
 
         layout = QtWidgets.QVBoxLayout(self)
         self.lbl = QtWidgets.QLabel("Ready"); layout.addWidget(self.lbl)
 
+        # --- 버튼 묶음 ---
         btns = QtWidgets.QGridLayout(); layout.addLayout(btns)
         b_calib = QtWidgets.QPushButton("Start Calibration")
         b_load  = QtWidgets.QPushButton("Load Model")
@@ -425,8 +425,40 @@ class ControlPanel(QtWidgets.QWidget):
         b_fs.clicked.connect(lambda: self.shared.set_cmd("toggle_fullscreen"))
         b_quit.clicked.connect(lambda: self.shared.set_cmd("quit"))
 
+        # --- 시각화 옵션 그룹 ---
+        grp = QtWidgets.QGroupBox("Visualization")
+        gl = QtWidgets.QGridLayout(grp)
+        self.cb_mesh        = QtWidgets.QCheckBox("Face Mesh");         self.cb_mesh.setChecked(True)
+        self.cb_center_box  = QtWidgets.QCheckBox("Center Box");        self.cb_center_box.setChecked(True)
+        self.cb_uv_text     = QtWidgets.QCheckBox("u/v Text");          self.cb_uv_text.setChecked(True)
+        self.cb_iris        = QtWidgets.QCheckBox("Iris center + (x,y)"); self.cb_iris.setChecked(True)
+        self.cb_ring        = QtWidgets.QCheckBox("Gaze Ring (overlay)");  self.cb_ring.setChecked(True)
+        self.cb_calib       = QtWidgets.QCheckBox("Calib Target (overlay)"); self.cb_calib.setChecked(True)
+        self.cb_status      = QtWidgets.QCheckBox("Status Text (overlay)");  self.cb_status.setChecked(True)
+        gl.addWidget(self.cb_mesh,       0,0)
+        gl.addWidget(self.cb_center_box, 0,1)
+        gl.addWidget(self.cb_uv_text,    1,0)
+        gl.addWidget(self.cb_iris,       1,1)
+        gl.addWidget(self.cb_ring,       2,0)
+        gl.addWidget(self.cb_calib,      2,1)
+        gl.addWidget(self.cb_status,     3,0)
+        layout.addWidget(grp)
+
+        # 체커 연결
+        self.cb_mesh.toggled.connect(lambda v: self._set("vis_mesh", v))
+        self.cb_center_box.toggled.connect(lambda v: self._set("vis_center_box", v))
+        self.cb_uv_text.toggled.connect(lambda v: self._set("vis_uv_text", v))
+        self.cb_iris.toggled.connect(lambda v: self._set("vis_iris", v))
+        self.cb_ring.toggled.connect(lambda v: self._set("vis_gaze_ring", v))
+        self.cb_calib.toggled.connect(lambda v: self._set("vis_calib_target", v))
+        self.cb_status.toggled.connect(lambda v: self._set("vis_status_text", v))
+
         self.timer = QtCore.QTimer(self); self.timer.timeout.connect(self.tick); self.timer.start(200)
         self.show()
+
+    def _set(self, name, val):
+        with self.shared.lock:
+            setattr(self.shared, name, bool(val))
 
     def _choose_and_load_model(self):
         os.makedirs(DATA_DIR, exist_ok=True)
@@ -470,8 +502,16 @@ class GazeWorker(threading.Thread):
             min_detection_confidence=0.5, min_tracking_confidence=0.5) as face_mesh:
 
             uL = vL = uR = vR = None
+            icL = icR = None  # 홍채 중심 좌표(픽셀)
 
             while not self.stop_flag.is_set():
+                # 플래그 스냅샷
+                with self.shared.lock:
+                    vis_mesh       = self.shared.vis_mesh
+                    vis_center_box = self.shared.vis_center_box
+                    vis_uv_text    = self.shared.vis_uv_text
+                    vis_iris       = self.shared.vis_iris
+
                 ok, frame = cap.read()
                 if not ok: continue
                 H, W = frame.shape[:2]
@@ -480,28 +520,35 @@ class GazeWorker(threading.Thread):
                 frame_out = frame.copy()
 
                 gaze_feat = None
+                uL = vL = uR = vR = None
+                icL = icR = None
+
                 if res.multi_face_landmarks:
                     lms = res.multi_face_landmarks[0].landmark
-                    (uL, vL), _ = _eye_uv(lms, LEFT_EYE_IDXS, LEFT_IRIS_IDXS, W, H)
-                    (uR, vR), _ = _eye_uv(lms, RIGHT_EYE_IDXS, RIGHT_IRIS_IDXS, W, H)
+                    (uL, vL), icL = _eye_uv(lms, LEFT_EYE_IDXS, LEFT_IRIS_IDXS, W, H)
+                    (uR, vR), icR = _eye_uv(lms, RIGHT_EYE_IDXS, RIGHT_IRIS_IDXS, W, H)
                     gaze_feat = _feat_vector(uL, vL, uR, vR)
 
-                    # 메쉬는 원본 프레임에 그린다 → 이후 프리뷰에서 필요시 좌우반전
-                    mp_drawing.draw_landmarks(
-                        image=frame_out, landmark_list=res.multi_face_landmarks[0],
-                        connections=mp_face_mesh.FACEMESH_TESSELATION,
-                        landmark_drawing_spec=None,
-                        connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_tesselation_style())
-                    mp_drawing.draw_landmarks(
-                        image=frame_out, landmark_list=res.multi_face_landmarks[0],
-                        connections=mp_face_mesh.FACEMESH_CONTOURS,
-                        landmark_drawing_spec=None,
-                        connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_contours_style())
-                    mp_drawing.draw_landmarks(
-                        image=frame_out, landmark_list=res.multi_face_landmarks[0],
-                        connections=mp_face_mesh.FACEMESH_IRISES,
-                        landmark_drawing_spec=None,
-                        connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_iris_connections_style())
+                    if vis_mesh:
+                        mp_drawing.draw_landmarks(
+                            image=frame_out, landmark_list=res.multi_face_landmarks[0],
+                            connections=mp_face_mesh.FACEMESH_TESSELATION,
+                            landmark_drawing_spec=None,
+                            connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_tesselation_style())
+                        mp_drawing.draw_landmarks(
+                            image=frame_out, landmark_list=res.multi_face_landmarks[0],
+                            connections=mp_face_mesh.FACEMESH_CONTOURS,
+                            landmark_drawing_spec=None,
+                            connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_contours_style())
+                        mp_drawing.draw_landmarks(
+                            image=frame_out, landmark_list=res.multi_face_landmarks[0],
+                            connections=mp_face_mesh.FACEMESH_IRISES,
+                            landmark_drawing_spec=None,
+                            connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_iris_connections_style())
+                    # 홍채 중심 점(프레임에 먼저 그려두면 이후 미러와 함께 뒤집힘)
+                    if vis_iris and (icL is not None) and (icR is not None):
+                        cv2.circle(frame_out, (int(icL[0]), int(icL[1])), 3, (0,255,255), -1)
+                        cv2.circle(frame_out, (int(icR[0]), int(icR[1])), 3, (255,255,0), -1)
 
                 # ---- 커맨드 처리 ----
                 if self.shared.pop_cmd("quit"): self.stop_flag.set(); break
@@ -532,7 +579,6 @@ class GazeWorker(threading.Thread):
                     target_px = calib.current_target_px()
                     finished = False
                     if gaze_feat is not None:
-                        # now_t를 넘겨주면 T가 더 정확히 들어간다(선택)
                         finished = calib.feed(gaze_feat, t_now=time.time())
 
                     with self.shared.lock:
@@ -543,9 +589,7 @@ class GazeWorker(threading.Thread):
                         self.shared.cross = None
 
                     if finished:
-                        # 1) 선형 모델 백업(pkl) → data/calib_gaze.pkl
                         calib.save_model_pkl()
-                        # 2) 데이터셋 저장(npz) → data/
                         meta_extra = {
                             "grid": self.args.grid,
                             "rows": rows,
@@ -567,7 +611,7 @@ class GazeWorker(threading.Thread):
                     if gaze_feat is not None and calib.has_model():
                         pred = calib.predict(gaze_feat)
                         if not hasattr(self, "_last"): self._last = np.array(pred, dtype=np.float32)
-                        self._last = smoother.filter(np.array(pred, dtype=np.float32))
+                        self._last = OneEuro().filter(np.array(pred, dtype=np.float32))
                         px = (int(self._last[0]), int(self._last[1]))
                     with self.shared.lock:
                         self.shared.calibrating = False
@@ -580,24 +624,33 @@ class GazeWorker(threading.Thread):
                 if self.args.webcam_window:
                     disp = frame_out
                     if self.args.mirror_preview:
-                        disp = cv2.flip(disp, 1)  # 얼굴은 셀피로
-                    # 텍스트는 프리뷰 후 그리기(글자 거울반전 방지)
-                    if uL is not None and uR is not None:
-                        txt = f"L({uL:+.2f},{vL:+.2f}) R({uR:+.2f},{vR:+.2f})"
-                        cv2.putText(disp, txt, (10,25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
-                    else:
-                        cv2.putText(disp, "No face", (10,25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+                        disp = cv2.flip(disp, 1)  # 얼굴/포인트 같이 반전
 
-                    # --- 중앙 정사각형(검정 테두리만) 그리기 ---
-                    s = 150  # 반쪽 길이(px) -> 정사각형 한 변 길이는 2*s
-                    h, w = disp.shape[:2]
-                    x1, y1 = w//2 - s, h//2 - s
-                    x2, y2 = w//2 + s, h//2 + s
-                    cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 0, 0), thickness=2, lineType=cv2.LINE_AA)
-                    cv2.rectangle(disp, (x1, int(y1 + 0.65*s)), (x2, int(y2-1.1*s)), (0, 0, 0), thickness=2, lineType=cv2.LINE_AA)
+                    # 텍스트/박스는 "반전 후"에 그려서 가독성 확보
+                    y_text = 25
+                    if uL is not None and uR is not None:
+                        if self.shared.vis_uv_text:
+                            txt1 = f"uL={uL:+.2f}, vL={vL:+.2f} | uR={uR:+.2f}, vR={vR:+.2f}"
+                            cv2.putText(disp, txt1, (10, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+                            y_text += 22
+                        if self.shared.vis_iris and (icL is not None) and (icR is not None):
+                            # 좌우반전 여부와 무관하게 원본 픽셀 좌표 표기(필요시 화면 좌표계로 변환 가능)
+                            txt2 = f"cL=({int(icL[0])},{int(icL[1])})  cR=({int(icR[0])},{int(icR[1])})"
+                            cv2.putText(disp, txt2, (10, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
+                            y_text += 22
+                    else:
+                        cv2.putText(disp, "No face", (10, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+                        y_text += 22
+
+                    if vis_center_box:
+                        s = 150
+                        h, w = disp.shape[:2]
+                        x1, y1 = w//2 - s, h//2 - s
+                        x2, y2 = w//2 + s, h//2 + s
+                        cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 0, 0), thickness=2, lineType=cv2.LINE_AA)
+                        cv2.rectangle(disp, (x1, int(y1 + 0.65*s)), (x2, int(y2-1.1*s)), (0, 0, 0), thickness=2, lineType=cv2.LINE_AA)
 
                     cv2.imshow('MediaPipe Face Mesh', disp)
-                    # 키 입력은 유지(원하면 여기 삭제 가능)
                     key = cv2.waitKey(1) & 0xFF
                     if key == 27: self.stop_flag.set(); break
                     elif key == ord('c'): self.shared.set_cmd("start_calib")
@@ -623,7 +676,6 @@ def parse_args():
     p.add_argument("--webcam_window", action="store_true", default=True, help="(기본) OpenCV 창 사용")
     p.add_argument("--no-webcam_window", dest="webcam_window", action="store_false", help="OpenCV 창 끄기")
 
-    # 기본값: 프리뷰 미러 ON (필요하면 --no-mirror_preview)
     p.add_argument("--mirror_preview", dest="mirror_preview", action="store_true",
                    help="프리뷰를 셀피(좌우반전)로 표시 (기본 ON)")
     p.add_argument("--no-mirror_preview", dest="mirror_preview", action="store_false",
