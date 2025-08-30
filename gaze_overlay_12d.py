@@ -399,17 +399,17 @@ class SharedState:
         self.substatus = "Use Control Panel"
 
         # 시각화 옵션
-        self.vis_mesh = True
-        self.vis_center_box = True
+        self.vis_mesh = False
+        self.vis_center_box = False
         self.vis_iris = True
         self.vis_gaze_ring = True
         self.vis_calib_target = True
         self.vis_status_text = True
 
-        self.vis_eye_axes = False                # Eye axes (fixed len)
-        self.vis_eye_axes_scaled = False         # Eye axes (eye len)
+        self.vis_eye_axes = True                # Eye axes (fixed len)
+        self.vis_eye_axes_scaled = True         # Eye axes (eye len)
         self.vis_uv_vectors = False              # u/v vectors
-        self.vis_uv_vectors_bigger = False       # u/v vectors (bigger)
+        self.vis_uv_vectors_bigger = True       # u/v vectors (bigger)
         self.uv_bigger_gain = 4.0                # u/v bigger gain
 
         # 스무딩 파라미터 (UI에서 조정)
@@ -596,19 +596,19 @@ class ControlPanel(QtWidgets.QWidget):
         grp = QtWidgets.QGroupBox("Visualization"); v.addWidget(grp)
         gl = QtWidgets.QGridLayout(grp)
         self.cb_mesh        = QtWidgets.QCheckBox("Face Mesh");            self.cb_mesh.setChecked(True)
-        self.cb_center_box  = QtWidgets.QCheckBox("Center Box");           self.cb_center_box.setChecked(True)
+        self.cb_center_box  = QtWidgets.QCheckBox("Box");           self.cb_center_box.setChecked(False)
         self.cb_iris        = QtWidgets.QCheckBox("Iris centers");         self.cb_iris.setChecked(True)
-        self.cb_axes        = QtWidgets.QCheckBox("Eye axes (fixed len)"); self.cb_axes.setChecked(False)
-        self.cb_axes_s      = QtWidgets.QCheckBox("Eye axes (eye len)");   self.cb_axes_s.setChecked(False)
+        self.cb_axes        = QtWidgets.QCheckBox("Eye axes (fixed len)"); self.cb_axes.setChecked(True)
+        self.cb_axes_s      = QtWidgets.QCheckBox("Eye axes (eye len)");   self.cb_axes_s.setChecked(True)
         self.cb_uvvec       = QtWidgets.QCheckBox("u/v vectors");          self.cb_uvvec.setChecked(False)
-        self.cb_uvvec_big   = QtWidgets.QCheckBox("u/v vectors (bigger)"); self.cb_uvvec_big.setChecked(False)
+        self.cb_uvvec_big   = QtWidgets.QCheckBox("u/v vectors (bigger)"); self.cb_uvvec_big.setChecked(True)
         self.sb_uv_gain     = QtWidgets.QDoubleSpinBox(); self.sb_uv_gain.setRange(0.1, 20.0)
         self.sb_uv_gain.setSingleStep(0.1); self.sb_uv_gain.setDecimals(1); self.sb_uv_gain.setValue(4.0)
         gl.addWidget(self.cb_mesh,       0,0); gl.addWidget(self.cb_center_box, 0,1)
         gl.addWidget(self.cb_iris,       1,0)
         gl.addWidget(self.cb_axes,       2,0); gl.addWidget(self.cb_axes_s,     2,1)
         gl.addWidget(self.cb_uvvec,      3,0); gl.addWidget(self.cb_uvvec_big,  3,1)
-        gl.addWidget(QtWidgets.QLabel("u/v bigger gain"), 4,0); gl.addWidget(self.sb_uv_gain, 4,1)
+        gl.addWidget(QtWidgets.QLabel("u/v bigger gain"), 4,0); gl.addWidget(self.sb_uv_gain, 4,0)
 
         # 스무딩(OneEuro + EMA)
         grp2 = QtWidgets.QGroupBox("Smoothing"); v.addWidget(grp2)
@@ -669,7 +669,7 @@ class ControlPanel(QtWidgets.QWidget):
 
     def _choose_and_load_model(self):
         fname, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Select model file", DATA_DIR, "Model files (*.npz *.pkl);;All files (*)")
+            self, "Select model file", "./models", "Model files (*.npz *.pkl);;All files (*)")
         if fname: self.shared.set_load_model(fname)
 
     def _on_vol_changed(self, v:int):
