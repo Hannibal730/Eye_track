@@ -4,21 +4,16 @@
 gaze_overlay_12d.py
 - MediaPipe Face Mesh(iris 포함)로 12D 시선 피처 추출(uL,vL,uR,vR + 2차 확장)
 - 캘리브레이션: 그리드(행x열, 지그재그), 포인트당 체류시간 수집
-- 타깃: 선택한 비디오 프레임을 포인트 중앙에 재생 + 오디오(선택, VLC/ffplay)
+- 타깃: 비디오 프레임을 포인트 중앙에 재생(+선택적 오디오)
 - 데이터 저장: data/gaze_samples_*.npz (X,Y,T,pt_index,screen,feature_names,meta)
 - 모델: 릿지 선형(.pkl/.npz 로드)
 - 스무딩: OneEuro + EMA
-- 시각화(토글): 메쉬/홍채/축/u-v 벡터/중앙박스/눈 컨투어 점+엣지
-- UI: Calibration rows/cols/per-point 입력, Stop Calibration(중단), 모델 로드/오버레이/풀스크린 등
-- (신규) MediaPipe FaceMesh 튜닝 노브/카메라 입력 품질 인자 추가
-
-실행 예:
-  python gaze_overlay_12d.py \
-    --cam_w 1280 --cam_h 720 --cam_fps 30 --cam_fourcc MJPG \
-    --mp_model_complexity 2 --mp_min_det 0.8 --mp_min_track 0.8 --mp_refine_landmarks
+- 시각화(토글): 메쉬/홍채/축/u-v 벡터/눈 컨투어 점+엣지
+- UI: Calibration 설정, Stop Calibration, Load Model, Toggle Overlay,
+      Calibration Module(시각화), Calibration Audio(오디오), Smoothing Factors, Quit
 """
 
-import os, sys, time, argparse, re, threading, json, subprocess, shutil
+import os, sys, time, argparse, re, threading, json, subprocess, shutil, inspect
 import numpy as np
 import cv2
 import mediapipe as mp
@@ -52,7 +47,7 @@ def _unique_idxs(connections):
     for a, b in connections: s.add(a); s.add(b)
     return sorted(s)
 
-# 눈꺼풀 경계(컨투어) 인덱스 집합
+# 눈꺼풀 컨투어 인덱스 집합
 LEFT_EYE_ALL_IDXS  = _unique_idxs(mp_face_mesh.FACEMESH_LEFT_EYE)
 RIGHT_EYE_ALL_IDXS = _unique_idxs(mp_face_mesh.FACEMESH_RIGHT_EYE)
 
@@ -68,9 +63,10 @@ def _pca_axes(pts: np.ndarray):
     X = pts - c
     U, S, Vt = np.linalg.svd(X, full_matrices=False)
     ax1, ax2 = Vt[0], Vt[1]
-    w = 2 * (np.sqrt(np.mean((X @ ax1)**2)) + 1e-6)
-    h = 2 * (np.sqrt(np.mean((X @ ax2)**2)) + 1e-6)
-    return c, ax1, ax2, w, h
+    # 축 길이(반경)
+    su = 2 * (np.sqrt(np.mean((X @ ax1)**2)) + 1e-6) / 2.0
+    sv = 2 * (np.sqrt(np.mean((X @ ax2)**2)) + 1e-6) / 2.0
+    return c, ax1, ax2, su, sv
 
 def _iris_center(landmarks, idxs, W, H):
     pts = np.array([(landmarks[i].x * W, landmarks[i].y * H) for i in idxs], dtype=np.float32)
@@ -78,10 +74,9 @@ def _iris_center(landmarks, idxs, W, H):
 
 def _eye_uv_ex(landmarks, eye_idxs, iris_idxs, W, H):
     eye_pts = np.array([(landmarks[i].x * W, landmarks[i].y * H) for i in eye_idxs], dtype=np.float32)
-    c, ax1, ax2, w, h = _pca_axes(eye_pts)
+    c, ax1, ax2, su, sv = _pca_axes(eye_pts)
     ic = _iris_center(landmarks, iris_idxs, W, H)
     delta = ic - c
-    su = w / 2.0; sv = h / 2.0
     du = float(np.dot(delta, ax1))   # Δ·û (px)
     dv = float(np.dot(delta, ax2))   # Δ·v̂ (px)
     u = float(du / su)
@@ -238,7 +233,7 @@ class OneEuro:
 
 # -------------------- 비디오/오디오 --------------------
 class VideoSource:
-    def __init__(self, path:str, out_width:int=320, use_cuda:bool=False):
+    def __init__(self, path:str, out_width:int=320, use_cuda:bool=True):
         self.path=path; self.cap=None
         self.out_w=int(max(64,out_width)); self.out_h=None
         self.use_cuda = (use_cuda and hasattr(cv2,"cuda") and cv2.cuda.getCudaEnabledDeviceCount()>0)
@@ -264,7 +259,8 @@ class VideoSource:
                 gpu=cv2.cuda_GpuMat(); gpu.upload(frame)
                 r=cv2.cuda.resize(gpu,(self.out_w,self.out_h))
                 return r.download()
-            except Exception: pass
+            except Exception:
+                pass
         return cv2.resize(frame,(self.out_w,self.out_h),interpolation=cv2.INTER_AREA)
     def read(self):
         if self.base_t is not None:
@@ -349,7 +345,7 @@ class SharedState:
         self.lock = threading.Lock()
         self.screen_w=sw; self.screen_h=sh
         self.cross=None; self.calib_target=None; self.calibrating=False
-        self.overlay_enabled=True; self.fullscreen=False
+        self.overlay_enabled=True
         self.status="Gaze Overlay"; self.substatus="Use Control Panel"
 
         # Calibration 설정(UI)
@@ -357,7 +353,6 @@ class SharedState:
 
         # 시각화 옵션
         self.vis_mesh=False
-        self.vis_center_box=False
         self.vis_iris=True
         self.vis_eye_axes=True           # Eye axes (fixed len)
         self.vis_eye_axes_scaled=True    # Eye axes (eye len)
@@ -376,12 +371,12 @@ class SharedState:
         self.calib_video_path=False
         self.video_frame=None
         self.video_size=(320,180)
-        self.cuda_enabled=(hasattr(cv2,"cuda") and cv2.cuda.getCudaEnabledDeviceCount()>0)
+        self.cuda_enabled=True   # 기본값 True (미지원 시 자동 CPU fallback)
         self.audio_enabled=True; self.audio_volume=80; self.audio_backend="auto"
 
         # 명령
         self.cmd={"start_calib":False,"stop_calib":False,"load_model":False,
-                  "toggle_overlay":False,"toggle_fullscreen":False,"quit":False}
+                  "toggle_overlay":False,"quit":False}
         self._load_path=None
 
     def set_cmd(self,name):
@@ -401,7 +396,7 @@ class OverlayWindow(QtWidgets.QWidget):
         super().__init__(None)
         self.shared=shared; self.app=app
         self.status="Gaze Overlay"; self.substatus="Use Control Panel"
-        self.cross=None; self.calib_target=None; self._last_fullscreen=False; self._vid_img=None
+        self.cross=None; self.calib_target=None; self._vid_img=None
 
         flags = (QtCore.Qt.WindowStaysOnTopHint | QtCore.Qt.FramelessWindowHint |
                  QtCore.Qt.Tool | QtCore.Qt.WindowDoesNotAcceptFocus)
@@ -427,7 +422,6 @@ class OverlayWindow(QtWidgets.QWidget):
             self.cross=self.shared.cross
             self.calib_target=self.shared.calib_target
             enabled=self.shared.overlay_enabled
-            fs=self.shared.fullscreen
             self.status=self.shared.status; self.substatus=self.shared.substatus
             vf=self.shared.video_frame
         self._vid_img = self._bgr_to_qimage(vf) if vf is not None else None
@@ -436,14 +430,6 @@ class OverlayWindow(QtWidgets.QWidget):
             if not self.isVisible(): self.setAttribute(QtCore.Qt.WA_ShowWithoutActivating, True); self.show()
         else:
             if self.isVisible(): self.hide()
-
-        if fs != self._last_fullscreen:
-            st = self.windowState()
-            if fs and not (st & QtCore.Qt.WindowFullScreen):
-                self.setWindowState(st | QtCore.Qt.WindowFullScreen)
-            elif not fs and (st & QtCore.Qt.WindowFullScreen):
-                self.setWindowState(st & ~QtCore.Qt.WindowFullScreen)
-            self._last_fullscreen = fs
         if enabled: self.update()
 
     def paintEvent(self,_):
@@ -473,48 +459,32 @@ class ControlPanel(QtWidgets.QWidget):
     def __init__(self, shared: SharedState):
         super().__init__()
         self.shared=shared
-        self.setWindowTitle("Gaze Control")
+        self.setWindowTitle("Control Panel")
         self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
         self.setFixedWidth(650)
 
         v = QtWidgets.QVBoxLayout(self)
-        self.lbl = QtWidgets.QLabel("Ready"); v.addWidget(self.lbl)
 
-        grid = QtWidgets.QGridLayout(); v.addLayout(grid)
-        b_calib = QtWidgets.QPushButton("Start Calibration")
-        b_load  = QtWidgets.QPushButton("Load Model (.npz/.pkl)")
-        b_ov    = QtWidgets.QPushButton("Toggle Overlay")
-        b_fs    = QtWidgets.QPushButton("Fullscreen")
-        b_stop  = QtWidgets.QPushButton("Stop Calibration")
-        b_quit  = QtWidgets.QPushButton("Quit")
-        grid.addWidget(b_calib,0,0); grid.addWidget(b_load,0,1)
-        grid.addWidget(b_ov,1,0); grid.addWidget(b_fs,1,1)
-        grid.addWidget(b_stop,2,0); grid.addWidget(b_quit,2,1)
-        b_calib.clicked.connect(lambda: self.shared.set_cmd("start_calib"))
-        b_stop .clicked.connect(lambda: self.shared.set_cmd("stop_calib"))
-        b_load .clicked.connect(self._choose_and_load_model)
-        b_ov   .clicked.connect(lambda: self.shared.set_cmd("toggle_overlay"))
-        b_fs   .clicked.connect(lambda: self.shared.set_cmd("toggle_fullscreen"))
-        b_quit .clicked.connect(lambda: self.shared.set_cmd("quit"))
-
-        grpC = QtWidgets.QGroupBox("Calibration"); v.addWidget(grpC)
+        # Calibration 설정
+        grpC = QtWidgets.QGroupBox("Calibration Grid"); v.addWidget(grpC)
         gc = QtWidgets.QGridLayout(grpC)
         self.sb_rows = QtWidgets.QSpinBox(); self.sb_rows.setRange(1,100); self.sb_rows.setValue(self.shared.calib_rows)
         self.sb_cols = QtWidgets.QSpinBox(); self.sb_cols.setRange(1,100); self.sb_cols.setValue(self.shared.calib_cols)
         self.sb_per  = QtWidgets.QDoubleSpinBox(); self.sb_per.setRange(0.1,10.0); self.sb_per.setSingleStep(0.1); self.sb_per.setDecimals(2); self.sb_per.setValue(self.shared.calib_per_point)
         gc.addWidget(QtWidgets.QLabel("Rows"),0,0); gc.addWidget(self.sb_rows,0,1)
-        gc.addWidget(QtWidgets.QLabel("Cols"),1,0); gc.addWidget(self.sb_cols,1,1)
+        gc.addWidget(QtWidgets.QLabel("Columns"),1,0); gc.addWidget(self.sb_cols,1,1)
         gc.addWidget(QtWidgets.QLabel("Per-point (sec)"),2,0); gc.addWidget(self.sb_per,2,1)
         self.sb_rows.valueChanged.connect(lambda v_: self._set("calib_rows", int(v_)))
         self.sb_cols.valueChanged.connect(lambda v_: self._set("calib_cols", int(v_)))
         self.sb_per .valueChanged.connect(lambda v_: self._set("calib_per_point", float(v_)))
 
+        # Calibration target (video)
         grpV = QtWidgets.QGroupBox("Calibration target (video)"); v.addWidget(grpV)
         gv = QtWidgets.QGridLayout(grpV)
         self.cb_usevid = QtWidgets.QCheckBox("Use video target"); self.cb_usevid.setChecked(True)
         self.btn_pick  = QtWidgets.QPushButton("Pick video...")
         self.sb_width  = QtWidgets.QSpinBox(); self.sb_width.setRange(80,1280); self.sb_width.setSingleStep(10); self.sb_width.setValue(320)
-        self.cb_cuda   = QtWidgets.QCheckBox("Use CUDA if available"); self.cb_cuda.setChecked(self.shared.cuda_enabled)
+        self.cb_cuda   = QtWidgets.QCheckBox("Use CUDA if available"); self.cb_cuda.setChecked(True)  # 기본 True
         gv.addWidget(self.cb_usevid,0,0,1,2)
         gv.addWidget(QtWidgets.QLabel("Video width (px)"),1,0); gv.addWidget(self.sb_width,1,1)
         gv.addWidget(self.cb_cuda,2,0,1,2)
@@ -524,7 +494,8 @@ class ControlPanel(QtWidgets.QWidget):
         self.sb_width.valueChanged.connect(lambda val: self._set_video_width(int(val)))
         self.btn_pick.clicked.connect(self._pick_video)
 
-        grpA = QtWidgets.QGroupBox("Audio"); v.addWidget(grpA)
+        # Audio 묶음 
+        grpA = QtWidgets.QGroupBox("Calibration Audio"); v.addWidget(grpA)
         ga = QtWidgets.QGridLayout(grpA)
         self.cb_audio = QtWidgets.QCheckBox("Play audio during calibration"); self.cb_audio.setChecked(True)
         self.sl_vol   = QtWidgets.QSlider(QtCore.Qt.Horizontal); self.sl_vol.setRange(0,100); self.sl_vol.setValue(80)
@@ -535,29 +506,45 @@ class ControlPanel(QtWidgets.QWidget):
         self.cb_audio.toggled.connect(lambda v_: self._set("audio_enabled", bool(v_)))
         self.sl_vol.valueChanged.connect(self._on_vol_changed)
 
-        # ---- Visualization 그룹 ----
+        # === Calibration Command 그룹 ===
+        grpCmd = QtWidgets.QGroupBox("Calibration Command")
+        glcmd  = QtWidgets.QGridLayout(grpCmd)
+        b_calib = QtWidgets.QPushButton("Start Calibration")
+        b_stop  = QtWidgets.QPushButton("Stop Calibration")
+        b_load  = QtWidgets.QPushButton("Load Model (.npz/.pkl)")
+        b_ov    = QtWidgets.QPushButton("Hide Overlay")
+        glcmd.addWidget(b_calib, 0, 0)
+        glcmd.addWidget(b_stop,  0, 1)
+        glcmd.addWidget(b_load,  1, 0)
+        glcmd.addWidget(b_ov,    1, 1)
+
+        b_calib.clicked.connect(lambda: self.shared.set_cmd("start_calib"))
+        b_stop .clicked.connect(lambda: self.shared.set_cmd("stop_calib"))
+        b_load .clicked.connect(self._choose_and_load_model)
+        b_ov   .clicked.connect(lambda: self.shared.set_cmd("toggle_overlay"))
+        v.addWidget(grpCmd)
+        
+        # Visualization 묶음 
         grp = QtWidgets.QGroupBox("Visualization"); v.addWidget(grp)
         gl = QtWidgets.QGridLayout(grp)
         self.cb_mesh        = QtWidgets.QCheckBox("Face Mesh");            self.cb_mesh.setChecked(False)
-        self.cb_center_box  = QtWidgets.QCheckBox("Box");                  self.cb_center_box.setChecked(False)
         self.cb_iris        = QtWidgets.QCheckBox("Iris centers");         self.cb_iris.setChecked(True)
-        self.cb_axes        = QtWidgets.QCheckBox("Eye axes (fixed len)"); self.cb_axes.setChecked(True)
-        self.cb_axes_s      = QtWidgets.QCheckBox("Eye axes (eye len)");   self.cb_axes_s.setChecked(True)
+        self.cb_axes   = QtWidgets.QCheckBox('Eye axes (fixed length; u_hat, v_hat)')
+        self.cb_axes_s = QtWidgets.QCheckBox('Eye axes (eye scaled length; s_u, s_v)')
         self.cb_uvvec       = QtWidgets.QCheckBox("u/v vectors");          self.cb_uvvec.setChecked(False)
         self.cb_uvvec_big   = QtWidgets.QCheckBox("u/v vectors (bigger)"); self.cb_uvvec_big.setChecked(True)
         self.sb_uv_gain     = QtWidgets.QDoubleSpinBox(); self.sb_uv_gain.setRange(0.1,20.0); self.sb_uv_gain.setSingleStep(0.1); self.sb_uv_gain.setDecimals(1); self.sb_uv_gain.setValue(4.0)
         self.cb_cnt_pts     = QtWidgets.QCheckBox("Eye contour points");   self.cb_cnt_pts.setChecked(False)
         self.cb_cnt_edges   = QtWidgets.QCheckBox("Eye contour edges");    self.cb_cnt_edges.setChecked(True)
-
-        gl.addWidget(self.cb_mesh,       0,0); gl.addWidget(self.cb_center_box, 0,1)
+        gl.addWidget(self.cb_mesh,       0,0)
         gl.addWidget(self.cb_iris,       1,0)
         gl.addWidget(self.cb_axes,       2,0); gl.addWidget(self.cb_axes_s,     2,1)
         gl.addWidget(self.cb_uvvec,      3,0); gl.addWidget(self.cb_uvvec_big,  3,1)
         gl.addWidget(QtWidgets.QLabel("u/v bigger gain"), 4,0); gl.addWidget(self.sb_uv_gain, 4,1)
         gl.addWidget(self.cb_cnt_pts,    5,0); gl.addWidget(self.cb_cnt_edges,  5,1)
 
-        # 스무딩
-        grp2 = QtWidgets.QGroupBox("Smoothing"); v.addWidget(grp2)
+        # Smoothing 묶음 → 이름 변경
+        grp2 = QtWidgets.QGroupBox("Smoothing Factors"); v.addWidget(grp2)
         g2 = QtWidgets.QGridLayout(grp2)
         g2.addWidget(QtWidgets.QLabel("OneEuro mincutoff"), 0,0)
         self.sb_minc = QtWidgets.QDoubleSpinBox(); self.sb_minc.setRange(0.01,2.0); self.sb_minc.setDecimals(3); self.sb_minc.setSingleStep(0.01); self.sb_minc.setValue(0.20)
@@ -571,25 +558,29 @@ class ControlPanel(QtWidgets.QWidget):
         g2.addWidget(QtWidgets.QLabel("EMA α"), 3,0)
         self.sb_ema = QtWidgets.QDoubleSpinBox(); self.sb_ema.setRange(0.0,1.0); self.sb_ema.setSingleStep(0.01); self.sb_ema.setValue(0.8)
         g2.addWidget(self.sb_ema,3,1)
+        self.sb_minc.valueChanged  .connect(lambda val: self._set("oe_mincutoff", float(val)))
+        self.sb_beta.valueChanged  .connect(lambda val: self._set("oe_beta", float(val)))
+        self.sb_dcut.valueChanged  .connect(lambda val: self._set("oe_dcutoff", float(val)))
+        self.sb_ema.valueChanged   .connect(lambda val: self._set("ema_alpha", float(val)))
 
+        # Quit 묶음
+        grpQ = QtWidgets.QGroupBox("Quit"); v.addWidget(grpQ)
+        gq = QtWidgets.QHBoxLayout(grpQ)
+        b_quit  = QtWidgets.QPushButton("Quit")
+        gq.addWidget(b_quit)
+        b_quit.clicked.connect(lambda: self.shared.set_cmd("quit"))
+        self.show()
+        
         # 바인딩
         self.cb_mesh.toggled       .connect(lambda v_: self._set("vis_mesh", v_))
-        self.cb_center_box.toggled .connect(lambda v_: self._set("vis_center_box", v_))
         self.cb_iris.toggled       .connect(lambda v_: self._set("vis_iris", v_))
         self.cb_axes.toggled       .connect(lambda v_: self._set("vis_eye_axes", v_))
         self.cb_axes_s.toggled     .connect(lambda v_: self._set("vis_eye_axes_scaled", v_))
         self.cb_uvvec.toggled      .connect(lambda v_: self._set("vis_uv_vectors", v_))
         self.cb_uvvec_big.toggled  .connect(lambda v_: self._set("vis_uv_vectors_bigger", v_))
         self.sb_uv_gain.valueChanged.connect(lambda val: self._set("uv_bigger_gain", float(val)))
-        self.sb_minc.valueChanged  .connect(lambda val: self._set("oe_mincutoff", float(val)))
-        self.sb_beta.valueChanged  .connect(lambda val: self._set("oe_beta", float(val)))
-        self.sb_dcut.valueChanged  .connect(lambda val: self._set("oe_dcutoff", float(val)))
-        self.sb_ema.valueChanged   .connect(lambda val: self._set("ema_alpha", float(val)))
         self.cb_cnt_pts.toggled    .connect(lambda v_: self._set("vis_eye_contour_pts",   v_))
         self.cb_cnt_edges.toggled  .connect(lambda v_: self._set("vis_eye_contour_edges", v_))
-
-        self.timer=QtCore.QTimer(self); self.timer.timeout.connect(self.tick); self.timer.start(200)
-        self.show()
 
     def _set(self,name,val):
         with self.shared.lock: setattr(self.shared,name,val)
@@ -606,7 +597,21 @@ class ControlPanel(QtWidgets.QWidget):
         self.lbl_vol.setText(str(int(v)))
         with self.shared.lock: self.shared.audio_volume=int(v)
     def tick(self):
-        with self.shared.lock: self.lbl.setText(self.shared.status)
+        pass
+
+# -------------------- FaceMesh 빌더(안전한 인자 필터) --------------------
+def build_facemesh(args):
+    sig = inspect.signature(mp_face_mesh.FaceMesh.__init__)
+    supported = set(sig.parameters.keys())
+    kw = {
+        "max_num_faces": 1,
+        "static_image_mode": False,
+        "refine_landmarks": args.mp_refine_landmarks,
+        "min_detection_confidence": args.mp_min_det,
+        "min_tracking_confidence": args.mp_min_track,
+    }
+    kw = {k:v for k,v in kw.items() if k in supported}
+    return mp_face_mesh.FaceMesh(**kw)
 
 # -------------------- 워커 --------------------
 class GazeWorker(threading.Thread):
@@ -620,7 +625,7 @@ class GazeWorker(threading.Thread):
         self.calib=Calibrator(shared.screen_w, shared.screen_h, 0,0, args.margin, args.per_point)
         with self.shared.lock: self.shared.audio_backend = self.audio.backend or "none"
 
-        # su/sv 안정화를 위한 히스토리(옵션적으로 사용 가능)
+        # su/sv 안정화를 위한 히스토리(필요 시 활용)
         self.su_hist_L = deque(maxlen=120); self.sv_hist_L = deque(maxlen=120)
         self.su_hist_R = deque(maxlen=120); self.sv_hist_R = deque(maxlen=120)
 
@@ -628,7 +633,7 @@ class GazeWorker(threading.Thread):
         with self.shared.lock:
             use = self.shared.use_video_target; vpath = self.shared.calib_video_path
             vw,vh = self.shared.video_size; use_cuda = self.shared.cuda_enabled
-        if use and os.path.isfile(vpath):
+        if use and vpath and os.path.isfile(vpath):
             try:
                 self.vid = VideoSource(vpath, out_width=vw, use_cuda=use_cuda)
                 with self.shared.lock: self.shared.video_size=(self.vid.out_w,self.vid.out_h)
@@ -647,7 +652,7 @@ class GazeWorker(threading.Thread):
         self.calib.begin()
         with self.shared.lock:
             audio_enabled=bool(self.shared.audio_enabled); audio_volume=int(self.shared.audio_volume); vpath=self.shared.calib_video_path
-        if audio_enabled and os.path.isfile(vpath): self.audio.start(vpath, loop=True, volume=audio_volume)
+        if audio_enabled and vpath and os.path.isfile(vpath): self.audio.start(vpath, loop=True, volume=audio_volume)
         if self.vid is not None: self.vid.set_base_time(time.monotonic())
 
     def _stop_calibration(self, save=False):
@@ -674,7 +679,7 @@ class GazeWorker(threading.Thread):
         if not cap.isOpened():
             print("Could not open webcam."); return
 
-        # (신규) C920 품질 설정
+        # C920 입력 품질 설정
         try:
             fourcc = cv2.VideoWriter_fourcc(*self.args.cam_fourcc)
             cap.set(cv2.CAP_PROP_FOURCC, fourcc)
@@ -694,19 +699,11 @@ class GazeWorker(threading.Thread):
 
         self._ensure_video()
 
-        # (신규) FaceMesh 노브 적용
-        with mp_face_mesh.FaceMesh(
-            max_num_faces=1,
-            static_image_mode=False,
-            refine_landmarks=self.args.mp_refine_landmarks,
-            min_detection_confidence=self.args.mp_min_det,
-            min_tracking_confidence=self.args.mp_min_track
-        ) as face_mesh:
-
+        # FaceMesh 생성(안전한 인자만 전달)
+        with build_facemesh(self.args) as face_mesh:
             while not self.stop_flag.is_set():
                 with self.shared.lock:
                     vis_mesh       = self.shared.vis_mesh
-                    vis_center_box = self.shared.vis_center_box
                     vis_iris       = self.shared.vis_iris
                     vis_axes       = self.shared.vis_eye_axes
                     vis_axes_s     = self.shared.vis_eye_axes_scaled
@@ -809,8 +806,6 @@ class GazeWorker(threading.Thread):
                             print("Model load failed:", e)
                 if self.shared.pop_cmd("toggle_overlay"):
                     with self.shared.lock: self.shared.overlay_enabled = not self.shared.overlay_enabled
-                if self.shared.pop_cmd("toggle_fullscreen"):
-                    with self.shared.lock: self.shared.fullscreen = not self.shared.fullscreen
 
                 # 모드별 처리
                 if self.calib.collecting:
@@ -846,23 +841,16 @@ class GazeWorker(threading.Thread):
                         self.shared.calibrating=False; self.shared.calib_target=None
                         self.shared.cross=px; self.shared.status="Gaze Overlay"; self.shared.substatus="Use Control Panel"
 
-                # 프리뷰
+                # 프리뷰 창(선택)
                 if self.args.webcam_window:
                     disp=out
                     if self.args.mirror_preview: disp=cv2.flip(disp,1)
-                    if vis_center_box:
-                        s=150; h,w=disp.shape[:2]
-                        x1,y1=w//2-s, h//2-s; x2,y2=w//2+s, h//2+s
-                        cv2.rectangle(disp,(x1,y1),(x2,y2),(0,0,0),2,cv2.LINE_AA)
-                        half=s//2
-                        cv2.rectangle(disp,(x1,y1+half),(x2,y2-half),(0,0,0),2,cv2.LINE_AA)
                     cv2.imshow('MediaPipe Face Mesh', disp)
                     k=cv2.waitKey(1)&0xFF
                     if k==27: self.stop_flag.set(); break
                     elif k==ord('c'): self.shared.set_cmd("start_calib")
                     elif k==ord('s'): self.shared.set_cmd("stop_calib")
                     elif k==ord('o'): self.shared.set_cmd("toggle_overlay")
-                    elif k==ord('f'): self.shared.set_cmd("toggle_fullscreen")
                 else:
                     time.sleep(0.001)
 
@@ -872,7 +860,7 @@ class GazeWorker(threading.Thread):
 
 # -------------------- 인자 --------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="MediaPipe FaceMesh + PyQt gaze overlay (12D) + video/audio target + eye contours")
+    p = argparse.ArgumentParser(description="MediaPipe FaceMesh + PyQt gaze overlay (12D) with video/audio target")
     # 기존 인자
     p.add_argument("--grid", type=str, default="", help="예: '4,8' 또는 '4x8'")
     p.add_argument("--rows", type=int, default=0); p.add_argument("--cols", type=int, default=0)
@@ -889,14 +877,13 @@ def parse_args():
     p.add_argument("--oe_beta", type=float, default=0.003)
     p.add_argument("--oe_dcutoff", type=float, default=1.0)
 
-    # (신규) MediaPipe “노브”
-    p.add_argument("--mp_min_det", type=float, default=0.75,
-                   help="min_detection_confidence (0~1, 높을수록 오검출↓)")
-    p.add_argument("--mp_min_track", type=float, default=0.75,
-                   help="min_tracking_confidence (0~1, 높을수록 추적 안정성↑)")
-    p.add_argument("--mp_refine_landmarks", action="store_true", default=True, help="홍채/입술 정밀 랜드마크 사용(정확도↑, 연산↑)")
+    # MediaPipe “노브”
+    p.add_argument("--mp_min_det", type=float, default=0.8, help="min_detection_confidence (0~1)")
+    p.add_argument("--mp_min_track", type=float, default=0.8, help="min_tracking_confidence (0~1)")
+    p.add_argument("--mp_refine_landmarks", action="store_true", default=True,
+                   help="홍채/입술 정밀 랜드마크 사용(정확도↑, 연산↑)")
 
-    # (신규) 카메라 입력 품질
+    # 카메라 입력 품질
     p.add_argument("--cam_w",   type=int, default=1920, help="캡처 가로 해상도")
     p.add_argument("--cam_h",   type=int, default=1080,  help="캡처 세로 해상도")
     p.add_argument("--cam_fps", type=int, default=30,   help="캡처 FPS")
