@@ -26,3 +26,14 @@ python train_from_csv.py --csv data/gaze_samples_*.csv --model xgb --val grid --
 
 
 python gaze_overlay_12d.py --grid 25x25 --per_point 5.0
+
+
+logitech c920 pro: 1920*1080*30fps
+lenovo legion pro: 1080*720p
+
+
+python gaze_overlay_12d.py   --cam_w 1920 --cam_h 1080 --cam_fps 30 --cam_fourcc MJPG   --mp_min_det 0.8 --mp_min_track 0.8 --camera 2
+
+
+
+
