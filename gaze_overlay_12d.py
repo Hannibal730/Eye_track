@@ -10,6 +10,8 @@ gaze_overlay_12d.py  (Calibration 타깃 영상 + 오디오 재생)
 - 모델: 선형회귀(릿지), .npz/.pkl 로드
 - 스무딩: OneEuro + EMA(α)
 - 시각화: 메쉬/홍채/축/u-v 벡터 등 토글
+- (신규) UI에서 Calibration Rows/Cols/Per-point(sec) 변경 가능
+- (신규) Calibration Stop 버튼 추가(Quit 왼쪽)
 
 예)
   python gaze_overlay_12d.py --grid 8x12 --per_point 2.0
@@ -22,6 +24,7 @@ import mediapipe as mp
 import pickle
 from datetime import datetime
 from PyQt5 import QtCore, QtGui, QtWidgets
+import time
 
 # 권장: X11/xcb
 os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
@@ -256,15 +259,22 @@ class OneEuro:
 # -------------------- 비디오 소스 --------------------
 class VideoSource:
     """
-    표준 VideoCapture로 디코딩하고, (옵션) cv2.cuda로 업로드/리사이즈.
-    끝까지 읽으면 자동 루프.
+    - 표준 VideoCapture 디코딩
+    - (옵션) cv2.cuda로 리사이즈
+    - 오디오 시계에 동기화: set_base_time(t0) 호출 후 read()가 프레임 스케줄링
     """
     def __init__(self, path:str, out_width:int=320, use_cuda:bool=False):
         self.path = path
         self.cap = None
         self.out_w = int(max(64, out_width))
-        self.out_h = None   # 비율에 따라 계산
-        self.use_cuda = (use_cuda and hasattr(cv2, "cuda") and cv2.cuda.getCudaEnabledDeviceCount() > 0)
+        self.out_h = None
+        self.use_cuda = (use_cuda and hasattr(cv2, "cuda")
+                         and cv2.cuda.getCudaEnabledDeviceCount() > 0)
+
+        self.fps = 30.0
+        self.frame_dt = 1.0 / self.fps
+        self.base_t = None          # 오디오 시작 시각(모노토닉)
+        self.cur_idx = 0            # 우리가 추적하는 현재 프레임 인덱스(0부터)
         self._open()
 
     def _open(self):
@@ -276,27 +286,73 @@ class VideoSource:
         ar = w / max(1, h)
         self.out_h = int(round(self.out_w / ar))
 
-    def read(self):
-        if self.cap is None: self._open()
-        ok, frame = self.cap.read()
-        if not ok:
-            # 루프
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            ok, frame = self.cap.read()
-            if not ok:
-                return False, None
+        fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        if not np.isfinite(fps) or fps <= 1.0:
+            fps = 30.0  # 안전 기본값
+        self.fps = fps
+        self.frame_dt = 1.0 / self.fps
+        self.cur_idx = 0
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+    def set_base_time(self, t0:float=None):
+        """오디오 재생 시작 직후 t0를 넘겨주세요(없으면 지금 시간으로 세팅)."""
+        self.base_t = float(t0 if t0 is not None else time.monotonic())
+        # 재생을 프레임 0부터 다시 시작
+        self.cur_idx = 0
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+    def _resize(self, frame):
         # 리사이즈 (GPU 가능 시)
         if self.use_cuda:
             try:
                 gpu = cv2.cuda_GpuMat()
                 gpu.upload(frame)
                 gpu_resized = cv2.cuda.resize(gpu, (self.out_w, self.out_h))
-                frame = gpu_resized.download()
+                return gpu_resized.download()
             except Exception:
-                frame = cv2.resize(frame, (self.out_w, self.out_h), interpolation=cv2.INTER_AREA)
-        else:
-            frame = cv2.resize(frame, (self.out_w, self.out_h), interpolation=cv2.INTER_AREA)
+                pass
+        return cv2.resize(frame, (self.out_w, self.out_h), interpolation=cv2.INTER_AREA)
+
+    def read(self):
+        if self.cap is None:
+            self._open()
+
+        # 스케줄러: base_t가 설정된 경우에만 동기화
+        if self.base_t is not None:
+            elapsed = time.monotonic() - self.base_t
+            target_idx = int(elapsed * self.fps)
+
+            # 우리가 너무 느리면(뒤쳐짐) target까지 프레임 건너뛰기
+            while self.cur_idx < target_idx:
+                ok = self.cap.grab()
+                if not ok:
+                    # 루프
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    self.cur_idx = 0
+                    continue
+                self.cur_idx += 1
+
+            # 우리가 너무 빠르면(앞섬) 약간 대기
+            ahead = (self.cur_idx - target_idx)
+            if ahead > 0:
+                sleep_t = min(ahead * self.frame_dt, 0.02)
+                if sleep_t > 0:
+                    time.sleep(sleep_t)
+
+        # 실제 프레임 얻기
+        ok, frame = self.cap.read()
+        if not ok:
+            # 루프
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            self.cur_idx = 0
+            ok, frame = self.cap.read()
+            if not ok:
+                return False, None
+
+        self.cur_idx += 1
+        frame = self._resize(frame)
         return True, frame  # BGR, (out_h,out_w,3)
+# ---------------------------------------------------------------------------
 
 # -------------------- 오디오 매니저 --------------------
 class AudioManager:
@@ -402,6 +458,12 @@ class SharedState:
         self.status = "Gaze Overlay"
         self.substatus = "Use Control Panel"
 
+        # (신규) 캘리브 설정(UI에서 변경)
+        self.calib_rows = 8
+        self.calib_cols = 12
+        self.calib_per_point = 2.0
+        self.calib_margin = 0.03  # 내부적으로는 유지
+
         # 시각화 옵션
         self.vis_mesh = False
         self.vis_center_box = False
@@ -412,9 +474,9 @@ class SharedState:
 
         self.vis_eye_axes = True                # Eye axes (fixed len)
         self.vis_eye_axes_scaled = True         # Eye axes (eye len)
-        self.vis_uv_vectors = False              # u/v vectors
+        self.vis_uv_vectors = False             # u/v vectors
         self.vis_uv_vectors_bigger = True       # u/v vectors (bigger)
-        self.uv_bigger_gain = 4.0                # u/v bigger gain
+        self.uv_bigger_gain = 4.0               # u/v bigger gain
 
         # 스무딩 파라미터 (UI에서 조정)
         self.ema_alpha = 0.8
@@ -436,7 +498,7 @@ class SharedState:
 
         # 명령 플래그 / 모델 로드 경로
         self.cmd = {
-            "start_calib": False, "load_model": False,
+            "start_calib": False, "stop_calib": False, "load_model": False,
             "toggle_overlay": False, "toggle_fullscreen": False,
             "quit": False
         }
@@ -543,26 +605,42 @@ class ControlPanel(QtWidgets.QWidget):
         self.shared = shared
         self.setWindowTitle("Gaze Control")
         self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
-        self.setFixedWidth(560)
+        self.setFixedWidth(600)
 
         v = QtWidgets.QVBoxLayout(self)
         self.lbl = QtWidgets.QLabel("Ready"); v.addWidget(self.lbl)
 
-        # 버튼
+        # 버튼 줄
         grid = QtWidgets.QGridLayout(); v.addLayout(grid)
         b_calib = QtWidgets.QPushButton("Start Calibration")
         b_load  = QtWidgets.QPushButton("Load Model (.npz/.pkl)")
         b_ov    = QtWidgets.QPushButton("Toggle Overlay")
         b_fs    = QtWidgets.QPushButton("Fullscreen")
+        b_stop  = QtWidgets.QPushButton("Stop Calibration")   # (신규) Quit 왼쪽
         b_quit  = QtWidgets.QPushButton("Quit")
         grid.addWidget(b_calib, 0,0); grid.addWidget(b_load, 0,1)
         grid.addWidget(b_ov,    1,0); grid.addWidget(b_fs,   1,1)
-        grid.addWidget(b_quit,  2,0,1,2)
+        grid.addWidget(b_stop,  2,0); grid.addWidget(b_quit, 2,1)
         b_calib.clicked.connect(lambda: self.shared.set_cmd("start_calib"))
+        b_stop.clicked.connect(lambda: self.shared.set_cmd("stop_calib"))
         b_load.clicked.connect(self._choose_and_load_model)
         b_ov.clicked.connect(lambda: self.shared.set_cmd("toggle_overlay"))
         b_fs.clicked.connect(lambda: self.shared.set_cmd("toggle_fullscreen"))
         b_quit.clicked.connect(lambda: self.shared.set_cmd("quit"))
+
+        # (신규) Calibration 설정
+        grpC = QtWidgets.QGroupBox("Calibration"); v.addWidget(grpC)
+        gc = QtWidgets.QGridLayout(grpC)
+        self.sb_rows = QtWidgets.QSpinBox(); self.sb_rows.setRange(1, 100); self.sb_rows.setValue(self.shared.calib_rows)
+        self.sb_cols = QtWidgets.QSpinBox(); self.sb_cols.setRange(1, 100); self.sb_cols.setValue(self.shared.calib_cols)
+        self.sb_per  = QtWidgets.QDoubleSpinBox(); self.sb_per.setRange(0.1, 10.0); self.sb_per.setSingleStep(0.1); self.sb_per.setDecimals(2); self.sb_per.setValue(self.shared.calib_per_point)
+        gc.addWidget(QtWidgets.QLabel("Rows"), 0,0); gc.addWidget(self.sb_rows, 0,1)
+        gc.addWidget(QtWidgets.QLabel("Cols"), 1,0); gc.addWidget(self.sb_cols, 1,1)
+        gc.addWidget(QtWidgets.QLabel("Per-point (sec)"), 2,0); gc.addWidget(self.sb_per, 2,1)
+        # 값 변경 → 공유 상태 반영
+        self.sb_rows.valueChanged.connect(lambda v_: self._set("calib_rows", int(v_)))
+        self.sb_cols.valueChanged.connect(lambda v_: self._set("calib_cols", int(v_)))
+        self.sb_per.valueChanged.connect(lambda v_: self._set("calib_per_point", float(v_)))
 
         # 캘리브 타깃 비디오
         grpV = QtWidgets.QGroupBox("Calibration target (video)"); v.addWidget(grpV)
@@ -599,8 +677,8 @@ class ControlPanel(QtWidgets.QWidget):
         # 시각화 옵션
         grp = QtWidgets.QGroupBox("Visualization"); v.addWidget(grp)
         gl = QtWidgets.QGridLayout(grp)
-        self.cb_mesh        = QtWidgets.QCheckBox("Face Mesh");            self.cb_mesh.setChecked(True)
-        self.cb_center_box  = QtWidgets.QCheckBox("Box");           self.cb_center_box.setChecked(False)
+        self.cb_mesh        = QtWidgets.QCheckBox("Face Mesh");            self.cb_mesh.setChecked(False)
+        self.cb_center_box  = QtWidgets.QCheckBox("Box");                  self.cb_center_box.setChecked(False)
         self.cb_iris        = QtWidgets.QCheckBox("Iris centers");         self.cb_iris.setChecked(True)
         self.cb_axes        = QtWidgets.QCheckBox("Eye axes (fixed len)"); self.cb_axes.setChecked(True)
         self.cb_axes_s      = QtWidgets.QCheckBox("Eye axes (eye len)");   self.cb_axes_s.setChecked(True)
@@ -612,7 +690,7 @@ class ControlPanel(QtWidgets.QWidget):
         gl.addWidget(self.cb_iris,       1,0)
         gl.addWidget(self.cb_axes,       2,0); gl.addWidget(self.cb_axes_s,     2,1)
         gl.addWidget(self.cb_uvvec,      3,0); gl.addWidget(self.cb_uvvec_big,  3,1)
-        gl.addWidget(QtWidgets.QLabel("u/v bigger gain"), 4,0); gl.addWidget(self.sb_uv_gain, 4,0)
+        gl.addWidget(QtWidgets.QLabel("u/v bigger gain"), 4,0); gl.addWidget(self.sb_uv_gain, 4,1)
 
         # 스무딩(OneEuro + EMA)
         grp2 = QtWidgets.QGroupBox("Smoothing"); v.addWidget(grp2)
@@ -696,6 +774,7 @@ class GazeWorker(threading.Thread):
         self.ema_last = None
         self.vid = None
         self.audio = AudioManager()
+        self.calib = Calibrator(shared.screen_w, shared.screen_h, 0, 0, args.margin, args.per_point)  # 빈 모델 홀더
         # 패널에 백엔드 표시를 위해 저장
         with self.shared.lock:
             self.shared.audio_backend = self.audio.backend or "none"
@@ -720,20 +799,41 @@ class GazeWorker(threading.Thread):
             self.vid = None
         return False
 
+    def _start_new_calibration(self):
+        # UI에서 설정한 rows/cols/per-point를 스냅샷
+        with self.shared.lock:
+            rows = int(self.shared.calib_rows)
+            cols = int(self.shared.calib_cols)
+            perp = float(self.shared.calib_per_point)
+            margin = float(self.shared.calib_margin)
+        self.calib = Calibrator(self.shared.screen_w, self.shared.screen_h,
+                                rows=rows, cols=cols, margin=margin, per_point_sec=perp)
+        self.calib.begin()
+        # 비디오/오디오 동기 시작
+        with self.shared.lock:
+            audio_enabled = bool(self.shared.audio_enabled)
+            audio_volume  = int(self.shared.audio_volume)
+            vpath         = self.shared.calib_video_path
+        if audio_enabled and os.path.isfile(vpath):
+            self.audio.start(vpath, loop=True, volume=audio_volume)
+        if self.vid is not None:
+            self.vid.set_base_time(time.monotonic())
+
+    def _stop_calibration(self, save=False):
+        # 저장 없이 중단(default)
+        if self.calib and self.calib.collecting:
+            self.calib.collecting = False
+        self.audio.stop()
+        with self.shared.lock:
+            self.shared.calibrating = False
+            self.shared.calib_target = None
+            self.shared.substatus = "Calibration stopped" if not save else "Calibration saved"
+        # (필요 시 save=True 분기에서 저장 처리 가능)
+
     def run(self):
         cap = cv2.VideoCapture(self.args.camera)
         if not cap.isOpened():
             print("Could not open webcam."); return
-
-        # 캘리브 설정
-        rows, cols = self.args.rows, self.args.cols
-        if self.args.grid:
-            m = re.match(r'^\s*(\d+)\s*[,xX]\s*(\d+)\s*$', self.args.grid)
-            if m: rows, cols = int(m.group(1)), int(m.group(2))
-            else: print("[Warn] --grid 예: 4,8 또는 4x8")
-        calib = Calibrator(self.shared.screen_w, self.shared.screen_h,
-                           rows=rows, cols=cols, margin=self.args.margin,
-                           per_point_sec=self.args.per_point)
 
         # 비디오 준비(없으면 이후 tick에서 재시도)
         self._ensure_video()
@@ -762,9 +862,6 @@ class GazeWorker(threading.Thread):
                     self.oe.dcutoff   = float(self.shared.oe_dcutoff)
 
                     use_video = bool(self.shared.use_video_target)
-                    audio_enabled = bool(self.shared.audio_enabled)
-                    audio_volume  = int(self.shared.audio_volume)
-                    vpath         = self.shared.calib_video_path
 
                 ok, frame = cap.read()
                 if not ok: continue
@@ -798,8 +895,8 @@ class GazeWorker(threading.Thread):
                             connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_iris_connections_style())
 
                     if vis_iris:
-                        cv2.circle(frame_out, (int(icL[0]), int(icL[1])), 3, (255,255,0), -1)  # L: mint
-                        cv2.circle(frame_out, (int(icR[0]), int(icR[1])), 3, (255,255,0), -1)  # R: 민트
+                        cv2.circle(frame_out, (int(icL[0]), int(icL[1])), 3, (255,255,0), -1)  # 민트
+                        cv2.circle(frame_out, (int(icR[0]), int(icR[1])), 3, (255,255,0), -1)
 
                     # 눈 축(고정 길이)
                     if vis_axes:
@@ -858,12 +955,15 @@ class GazeWorker(threading.Thread):
 
                 # ---- 명령 처리 ----
                 if self.shared.pop_cmd("quit"): self.stop_flag.set(); break
-                if self.shared.pop_cmd("start_calib"): calib.begin()
+                if self.shared.pop_cmd("start_calib"):
+                    self._start_new_calibration()
+                if self.shared.pop_cmd("stop_calib"):
+                    self._stop_calibration(save=False)
                 if self.shared.pop_cmd("load_model"):
                     path = self.shared.pop_load_path()
                     if path:
                         try:
-                            calib.load_linear_model(path)
+                            self.calib.load_linear_model(path)
                             with self.shared.lock: self.shared.status = "Model loaded"
                             print(f"[Model] Loaded: {path}")
                         except Exception as e:
@@ -876,34 +976,28 @@ class GazeWorker(threading.Thread):
                     with self.shared.lock: self.shared.fullscreen = not self.shared.fullscreen
 
                 # ---- 캘리브/런타임 ----
-                if calib.collecting:
-                    # 오디오: 캘리브 시작 시점 트리거
-                    if not was_collecting:
-                        if audio_enabled and os.path.isfile(vpath):
-                            self.audio.start(vpath, loop=True, volume=audio_volume)
-                        was_collecting = True
-
-                    target_px = calib.current_target_px()
+                if self.calib.collecting:
+                    target_px = self.calib.current_target_px()
                     finished = False
                     if gaze_feat is not None:
-                        finished = calib.feed(gaze_feat, t_now=time.time())
+                        finished = self.calib.feed(gaze_feat, t_now=time.time())
                     with self.shared.lock:
                         self.shared.calibrating = True
                         self.shared.calib_target = target_px
-                        self.shared.status = f"Calibration {calib.idx+1}/{calib.n_points()}"
+                        self.shared.status = f"Calibration {self.calib.idx+1}/{self.calib.n_points()}"
                         self.shared.substatus = "표시되는 영상 중앙을 응시하세요 (자동 진행)"
                         self.shared.cross = None
 
                     if finished:
                         # 종료 처리(모델/데이터 저장 + 오디오 정지)
-                        calib.save_model_pkl()
-                        ds_path = calib.save_dataset_npz(DATA_DIR, {
-                            "grid": self.args.grid, "rows": rows, "cols": cols,
-                            "margin": float(self.args.margin), "camera_index": int(self.args.camera),
+                        self.calib.save_model_pkl()
+                        ds_path = self.calib.save_dataset_npz(DATA_DIR, {
+                            "rows": self.calib.rows, "cols": self.calib.cols,
+                            "margin": float(self.calib.margin), "per_point_sec": float(self.calib.per_point_sec),
+                            "camera_index": int(self.args.camera),
                             "mirror_preview": bool(self.args.mirror_preview)
                         })
                         self.audio.stop()
-                        was_collecting = False
                         with self.shared.lock:
                             self.shared.calibrating = False
                             self.shared.calib_target = None
@@ -911,19 +1005,15 @@ class GazeWorker(threading.Thread):
                             self.shared.substatus = f"Saved: {os.path.basename(ds_path)}"
                 else:
                     # 러닝 모드
-                    if was_collecting:
-                        self.audio.stop()
-                        was_collecting = False
-
                     px = None
-                    if (gaze_feat is not None) and calib.has_model():
-                        pred = np.array(calib.predict(gaze_feat), dtype=np.float32)
+                    if (gaze_feat is not None) and self.calib.has_model():
+                        pred = np.array(self.calib.predict(gaze_feat), dtype=np.float32)
                         # 1) OneEuro
                         oe = self.oe.filter(pred, t=time.time())
                         # 2) EMA
                         if self.ema_last is None: self.ema_last = oe.copy()
                         else:
-                            self.ema_last = ema_a*self.ema_last + (1.0-ema_a)*oe
+                            self.ema_last = float(self.shared.ema_alpha)*self.ema_last + (1.0-float(self.shared.ema_alpha))*oe
                         sm = self.ema_last
                         px = (int(sm[0]), int(sm[1]))
                     with self.shared.lock:
@@ -950,6 +1040,7 @@ class GazeWorker(threading.Thread):
                     k = cv2.waitKey(1) & 0xFF
                     if k == 27: self.stop_flag.set(); break
                     elif k == ord('c'): self.shared.set_cmd("start_calib")
+                    elif k == ord('s'): self.shared.set_cmd("stop_calib")
                     elif k == ord('o'): self.shared.set_cmd("toggle_overlay")
                     elif k == ord('f'): self.shared.set_cmd("toggle_fullscreen")
                 else:
@@ -992,7 +1083,21 @@ def main():
 
     args = parse_args()
 
+    # 초기 grid/per-point 값을 인자에서 공유 상태로 반영
+    init_rows, init_cols = 0, 0
+    if args.grid:
+        m = re.match(r'^\s*(\d+)\s*[,xX]\s*(\d+)\s*$', args.grid)
+        if m:
+            init_rows, init_cols = int(m.group(1)), int(m.group(2))
+    if args.rows: init_rows = args.rows
+    if args.cols: init_cols = args.cols
+    if init_rows <= 0: init_rows = shared.calib_rows
+    if init_cols <= 0: init_cols = shared.calib_cols
     with shared.lock:
+        shared.calib_rows = init_rows
+        shared.calib_cols = init_cols
+        shared.calib_per_point = float(args.per_point)
+        shared.calib_margin = float(args.margin)
         shared.ema_alpha = float(args.ema_a)
         shared.oe_mincutoff = float(args.oe_mincutoff)
         shared.oe_beta = float(args.oe_beta)
