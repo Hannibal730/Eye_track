@@ -14,7 +14,7 @@ python gaze_overlay_21d.py --grid 15x12 --per_point 3.0
 pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu129
 
 
-python convert_npz_to_csv.py --glob "gaze_samples_20250830_*.npz"
+python convert_npz_to_csv.py --glob "gaze_samples_*.npz"
 
 
 python train_from_csv.py --csv data/gaze_samples_*.csv --model mlp --val random --epochs 20000 --out models/mlp_12d
