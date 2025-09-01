@@ -544,6 +544,7 @@ class ControlPanel(QtWidgets.QWidget):
         gl = QtWidgets.QGridLayout(grp)
         self.cb_mesh        = QtWidgets.QCheckBox("Face Mesh");            self.cb_mesh.setChecked(False)
         self.cb_iris        = QtWidgets.QCheckBox("Iris centers");         self.cb_iris.setChecked(True)
+        self.cb_iris_quad   = QtWidgets.QCheckBox("Iris 4-edges");    self.cb_iris_quad.setChecked(True)
         self.cb_axes   = QtWidgets.QCheckBox('Eye axes (fixed length; u_hat, v_hat)');   self.cb_axes.setChecked(True)
         self.cb_axes_s = QtWidgets.QCheckBox('Eye axes (eye scaled length; s_u, s_v)');  self.cb_axes_s.setChecked(False)
         self.cb_uvvec       = QtWidgets.QCheckBox("u, v vectors");          self.cb_uvvec.setChecked(False)
@@ -552,7 +553,7 @@ class ControlPanel(QtWidgets.QWidget):
         self.cb_cnt_pts     = QtWidgets.QCheckBox("Eye contour points");   self.cb_cnt_pts.setChecked(False)
         self.cb_cnt_edges   = QtWidgets.QCheckBox("Eye contour edges");    self.cb_cnt_edges.setChecked(True)
         gl.addWidget(self.cb_mesh,       0,0)
-        gl.addWidget(self.cb_iris,       1,0)
+        gl.addWidget(self.cb_iris,       1,0); gl.addWidget(self.cb_iris_quad,  1,1)
         gl.addWidget(self.cb_axes,       2,0); gl.addWidget(self.cb_axes_s,     2,1)
         gl.addWidget(self.cb_uvvec,      3,0); gl.addWidget(self.cb_uvvec_big,  3,1)
         gl.addWidget(QtWidgets.QLabel("u/v bigger times"), 4,0); gl.addWidget(self.sb_uv_gain, 4,1)
@@ -589,6 +590,7 @@ class ControlPanel(QtWidgets.QWidget):
         # 바인딩
         self.cb_mesh.toggled       .connect(lambda v_: self._set("vis_mesh", v_))
         self.cb_iris.toggled       .connect(lambda v_: self._set("vis_iris", v_))
+        self.cb_iris_quad.toggled  .connect(lambda v_: self._set("vis_iris_quad", v_))
         self.cb_axes.toggled       .connect(lambda v_: self._set("vis_eye_axes", v_))
         self.cb_axes_s.toggled     .connect(lambda v_: self._set("vis_eye_axes_scaled", v_))
         self.cb_uvvec.toggled      .connect(lambda v_: self._set("vis_uv_vectors", v_))
@@ -762,25 +764,53 @@ class GazeWorker(threading.Thread):
 
                     # 홍채 중심
                     if vis_iris:
-                        cv2.circle(out,(int(icL[0]),int(icL[1])),3,(255,255,0),-1)
+                        cv2.circle(out,(int(icL[0]),int(icL[1])),3,(255,255,0),-1) # radius=3
                         cv2.circle(out,(int(icR[0]),int(icR[1])),3,(255,255,0),-1)
 
                     # (신규) 홍채 4점 엣지
                     if vis_iris_quad:
                         ptsL = np.array([(lms[i].x * W, lms[i].y * H) for i in LEFT_IRIS_IDXS],  dtype=np.float32)
                         ptsR = np.array([(lms[i].x * W, lms[i].y * H) for i in RIGHT_IRIS_IDXS], dtype=np.float32)
-                        for pts, color in [(ptsL, (0,255,255)),  # 노란(Left)
+                        for pts, color in [(ptsL, (255,255,0)), 
                                            (ptsR, (255,255,0))]: # 청록(Right)
                             ordered = _order_quad_clockwise(pts)
                             poly    = ordered.astype(np.int32).reshape(-1,1,2)
-                            cv2.polylines(out, [poly], isClosed=True, color=color, thickness=2, lineType=cv2.LINE_AA)
+                            cv2.polylines(out, [poly], isClosed=True, color=color, thickness=1, lineType=cv2.LINE_AA)
 
-                    # 고정 길이/눈 크기 길이 축
+
+                    # 고정 길이 축: 왼쪽/오른쪽 서로 다르게
                     if vis_axes:
-                        for c,a1,a2 in [(cL,ax1L,ax2L),(cR,ax1R,ax2R)]:
-                            L=25
-                            cv2.line(out,(int(c[0]-a1[0]*L),int(c[1]-a1[1]*L)),(int(c[0]+a1[0]*L),int(c[1]+a1[1]*L)),(0,255,0),1,cv2.LINE_AA)
-                            cv2.line(out,(int(c[0]-a2[0]*L),int(c[1]-a2[1]*L)),(int(c[0]+a2[0]*L),int(c[1]+a2[1]*L)),(255,0,0),1,cv2.LINE_AA)
+                        # --- 왼쪽 눈 설정 ---
+                        L_L     = 25                 # 왼쪽 축 길이(px)
+                        col_u_L = (0, 225, 0)        # 왼쪽 u-축 색 (BGR)
+                        col_v_L = (0, 255, 0)        # 왼쪽 v-축 색 (BGR)
+                        th_L    = 1                  # 왼쪽 선 두께
+
+                        cv2.line(out,
+                                (int(cL[0] - ax1L[0]*L_L), int(cL[1] - ax1L[1]*L_L)),
+                                (int(cL[0] + ax1L[0]*L_L), int(cL[1] + ax1L[1]*L_L)),
+                                col_u_L, th_L, cv2.LINE_AA)
+                        cv2.line(out,
+                                (int(cL[0] - ax2L[0]*L_L), int(cL[1] - ax2L[1]*L_L)),
+                                (int(cL[0] + ax2L[0]*L_L), int(cL[1] + ax2L[1]*L_L)),
+                                col_v_L, th_L, cv2.LINE_AA)
+
+                        # --- 오른쪽 눈 설정 ---
+                        L_R     = 25                 # 오른쪽 축 길이(px) — 왼쪽과 다르게
+                        col_u_R = (0, 0, 255)      # 오른쪽 u-축 색 (BGR)
+                        col_v_R = (0, 0, 255)      # 오른쪽 v-축 색 (BGR)
+                        th_R    = 1                  # 오른쪽 선 두께
+
+                        cv2.line(out,
+                                (int(cR[0] - ax1R[0]*L_R), int(cR[1] - ax1R[1]*L_R)),
+                                (int(cR[0] + ax1R[0]*L_R), int(cR[1] + ax1R[1]*L_R)),
+                                col_u_R, th_R, cv2.LINE_AA)
+                        cv2.line(out,
+                                (int(cR[0] - ax2R[0]*L_R), int(cR[1] - ax2R[1]*L_R)),
+                                (int(cR[0] + ax2R[0]*L_R), int(cR[1] + ax2R[1]*L_R)),
+                                col_v_R, th_R, cv2.LINE_AA)        
+                            
+                            
                     if vis_axes_s:
                         for c,a1,a2,su,sv in [(cL,ax1L,ax2L,suL,svL),(cR,ax1R,ax2R,suR,svR)]:
                             cv2.line(out,(int(c[0]-a1[0]*su),int(c[1]-a1[1]*su)),(int(c[0]+a1[0]*su),int(c[1]+a1[1]*su)),(255,0,255),1,cv2.LINE_AA)
@@ -801,11 +831,11 @@ class GazeWorker(threading.Thread):
 
                     # 눈 컨투어
                     if vis_cnt_pts:
-                        self._draw_points(out, l_eye_pts, (0,255,255), r=2)
-                        self._draw_points(out, r_eye_pts, (0,255,255), r=2)
+                        self._draw_points(out, l_eye_pts, (0,255,0), r=2)
+                        self._draw_points(out, r_eye_pts, (0,0,255), r=2)
                     if vis_cnt_edges:
-                        self._draw_edges(out, mp_face_mesh.FACEMESH_LEFT_EYE,  lms, W, H, color=(0,200,255), thickness=1)
-                        self._draw_edges(out, mp_face_mesh.FACEMESH_RIGHT_EYE, lms, W, H, color=(0,200,255), thickness=1)
+                        self._draw_edges(out, mp_face_mesh.FACEMESH_LEFT_EYE,  lms, W, H, color=(0,255,0), thickness=1)
+                        self._draw_edges(out, mp_face_mesh.FACEMESH_RIGHT_EYE, lms, W, H, color=(0,0,255), thickness=1)
 
                 # 캘리브 타깃 비디오 프레임
                 with self.shared.lock: want_video = bool(self.shared.use_video_target)
