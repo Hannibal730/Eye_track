@@ -8,9 +8,9 @@ gaze_overlay_12d.py
 - 데이터 저장: data/gaze_samples_*.npz (X,Y,T,pt_index,screen,feature_names,meta)
 - 모델: 릿지 선형(.pkl/.npz 로드)
 - 스무딩: OneEuro + EMA
-- 시각화(토글): 메쉬/홍채/축/u-v 벡터/눈 컨투어 점+엣지
-- UI: Calibration 설정, Stop Calibration, Load Model, Toggle Overlay,
-      Calibration Module(시각화), Calibration Audio(오디오), Smoothing Factors, Quit
+- 시각화(토글): FaceMesh/홍채 중심/홍채 4점 엣지/축/u-v 벡터/눈 컨투어 점+엣지
+- UI: Calibration 설정, Calibration target(video), Calibration Module(시각화),
+      Calibration Audio(오디오), Calibration Command(시작/중지/로드/토글), Smoothing Factors, Quit
 """
 
 import os, sys, time, argparse, re, threading, json, subprocess, shutil, inspect
@@ -39,6 +39,7 @@ mp_drawing_styles  = mp.solutions.drawing_styles
 mp_face_mesh       = mp.solutions.face_mesh
 
 # 홍채(iris) 4점(정밀 랜드마크)
+# MediaPipe 기준: 좌안 474~477, 우안 469~472
 LEFT_IRIS_IDXS  = [474, 475, 476, 477]
 RIGHT_IRIS_IDXS = [469, 470, 471, 472]
 
@@ -89,6 +90,16 @@ def _feat_vector(uL, vL, uR, vR):
         uL*uL, vL*vL, uR*uR, vR*vR,
         uL*vL, uR*vR, uL*uR, vL*vR
     ], dtype=np.float32)
+
+def _order_quad_clockwise(pts_xy: np.ndarray) -> np.ndarray:
+    """
+    pts_xy: (4,2) float32/float64
+    반환: 중심 기준 각도 정렬(폐곡선 작성 안정화)
+    """
+    c = pts_xy.mean(axis=0)
+    ang = np.arctan2(pts_xy[:,1] - c[1], pts_xy[:,0] - c[0])
+    order = np.argsort(ang)
+    return pts_xy[order]
 
 # -------------------- 캘리브 --------------------
 def make_grid_points(rows:int, cols:int, margin:float=0.10, order:str="serpentine"):
@@ -353,9 +364,10 @@ class SharedState:
 
         # 시각화 옵션
         self.vis_mesh=False
-        self.vis_iris=True
-        self.vis_eye_axes=True           # Eye axes (fixed len)
-        self.vis_eye_axes_scaled=False    # Eye axes (eye len)
+        self.vis_iris=True                 # 홍채 중심점
+        self.vis_iris_quad=True           # (신규) 홍채 4점 엣지
+        self.vis_eye_axes=True             # Eye axes (fixed len: û, v̂)
+        self.vis_eye_axes_scaled=False      # Eye axes (eye len: s_u, s_v)
         self.vis_uv_vectors=False
         self.vis_uv_vectors_bigger=True
         self.uv_bigger_gain=4.0
@@ -494,8 +506,11 @@ class ControlPanel(QtWidgets.QWidget):
         self.sb_width.valueChanged.connect(lambda val: self._set_video_width(int(val)))
         self.btn_pick.clicked.connect(self._pick_video)
 
-        # Audio 묶음 
-        grpA = QtWidgets.QGroupBox("Calibration Audio"); v.addWidget(grpA)
+
+
+        # Calibration Audio
+        grpA = QtWidgets.QGroupBox("Calibration Audio")
+        v.addWidget(grpA)
         ga = QtWidgets.QGridLayout(grpA)
         self.cb_audio = QtWidgets.QCheckBox("Play audio during calibration"); self.cb_audio.setChecked(True)
         self.sl_vol   = QtWidgets.QSlider(QtCore.Qt.Horizontal); self.sl_vol.setRange(0,100); self.sl_vol.setValue(80)
@@ -596,8 +611,6 @@ class ControlPanel(QtWidgets.QWidget):
     def _on_vol_changed(self,v:int):
         self.lbl_vol.setText(str(int(v)))
         with self.shared.lock: self.shared.audio_volume=int(v)
-    def tick(self):
-        pass
 
 # -------------------- FaceMesh 빌더(안전한 인자 필터) --------------------
 def build_facemesh(args):
@@ -679,7 +692,7 @@ class GazeWorker(threading.Thread):
         if not cap.isOpened():
             print("Could not open webcam."); return
 
-        # C920 입력 품질 설정
+        # 입력 품질(가능하면 MJPG 고정)
         try:
             fourcc = cv2.VideoWriter_fourcc(*self.args.cam_fourcc)
             cap.set(cv2.CAP_PROP_FOURCC, fourcc)
@@ -705,6 +718,7 @@ class GazeWorker(threading.Thread):
                 with self.shared.lock:
                     vis_mesh       = self.shared.vis_mesh
                     vis_iris       = self.shared.vis_iris
+                    vis_iris_quad  = self.shared.vis_iris_quad
                     vis_axes       = self.shared.vis_eye_axes
                     vis_axes_s     = self.shared.vis_eye_axes_scaled
                     vis_uvvec      = self.shared.vis_uv_vectors
@@ -746,10 +760,22 @@ class GazeWorker(threading.Thread):
                             mp_face_mesh.FACEMESH_IRISES, None,
                             mp_drawing_styles.get_default_face_mesh_iris_connections_style())
 
+                    # 홍채 중심
                     if vis_iris:
                         cv2.circle(out,(int(icL[0]),int(icL[1])),3,(255,255,0),-1)
                         cv2.circle(out,(int(icR[0]),int(icR[1])),3,(255,255,0),-1)
 
+                    # (신규) 홍채 4점 엣지
+                    if vis_iris_quad:
+                        ptsL = np.array([(lms[i].x * W, lms[i].y * H) for i in LEFT_IRIS_IDXS],  dtype=np.float32)
+                        ptsR = np.array([(lms[i].x * W, lms[i].y * H) for i in RIGHT_IRIS_IDXS], dtype=np.float32)
+                        for pts, color in [(ptsL, (0,255,255)),  # 노란(Left)
+                                           (ptsR, (255,255,0))]: # 청록(Right)
+                            ordered = _order_quad_clockwise(pts)
+                            poly    = ordered.astype(np.int32).reshape(-1,1,2)
+                            cv2.polylines(out, [poly], isClosed=True, color=color, thickness=2, lineType=cv2.LINE_AA)
+
+                    # 고정 길이/눈 크기 길이 축
                     if vis_axes:
                         for c,a1,a2 in [(cL,ax1L,ax2L),(cR,ax1R,ax2R)]:
                             L=25
@@ -760,6 +786,7 @@ class GazeWorker(threading.Thread):
                             cv2.line(out,(int(c[0]-a1[0]*su),int(c[1]-a1[1]*su)),(int(c[0]+a1[0]*su),int(c[1]+a1[1]*su)),(255,0,255),1,cv2.LINE_AA)
                             cv2.line(out,(int(c[0]-a2[0]*sv),int(c[1]-a2[1]*sv)),(int(c[0]+a2[0]*sv),int(c[1]+a2[1]*sv)),(0,255,255),1,cv2.LINE_AA)
 
+                    # u/v 벡터
                     if vis_uvvec or vis_uvvec_big:
                         for (c,a1,a2,su,sv,u,v) in [(cL,ax1L,ax2L,suL,svL,uL,vL),(cR,ax1R,ax2R,suR,svR,uR,vR)]:
                             base=(int(c[0]),int(c[1]))
@@ -772,14 +799,13 @@ class GazeWorker(threading.Thread):
                                 cv2.arrowedLine(out, base, (base[0]+int(big_u[0]), base[1]+int(big_u[1])), (255,0,255),3,tipLength=0.25)
                                 cv2.arrowedLine(out, base, (base[0]+int(big_v[0]), base[1]+int(big_v[1])), (0,255,255),3,tipLength=0.25)
 
-                    l_eye_pts_xy = l_eye_pts
-                    r_eye_pts_xy = r_eye_pts
+                    # 눈 컨투어
                     if vis_cnt_pts:
-                        self._draw_points(out, l_eye_pts_xy, (0,255,255), r=2)
-                        self._draw_points(out, r_eye_pts_xy, (0,255,255), r=2)
+                        self._draw_points(out, l_eye_pts, (0,255,255), r=2)
+                        self._draw_points(out, r_eye_pts, (0,255,255), r=2)
                     if vis_cnt_edges:
-                        self._draw_edges(out, mp_face_mesh.FACEMESH_LEFT_EYE,  lms, W, H, color=(0,0,255), thickness=1)
-                        self._draw_edges(out, mp_face_mesh.FACEMESH_RIGHT_EYE, lms, W, H, color=(0,0,255), thickness=1)
+                        self._draw_edges(out, mp_face_mesh.FACEMESH_LEFT_EYE,  lms, W, H, color=(0,200,255), thickness=1)
+                        self._draw_edges(out, mp_face_mesh.FACEMESH_RIGHT_EYE, lms, W, H, color=(0,200,255), thickness=1)
 
                 # 캘리브 타깃 비디오 프레임
                 with self.shared.lock: want_video = bool(self.shared.use_video_target)
@@ -878,8 +904,8 @@ def parse_args():
     p.add_argument("--oe_dcutoff", type=float, default=1.0)
 
     # MediaPipe “노브”
-    p.add_argument("--mp_min_det", type=float, default=0.8, help="min_detection_confidence (0~1)")
-    p.add_argument("--mp_min_track", type=float, default=0.8, help="min_tracking_confidence (0~1)")
+    p.add_argument("--mp_min_det", type=float, default=0.75, help="min_detection_confidence (0~1)")
+    p.add_argument("--mp_min_track", type=float, default=0.75, help="min_tracking_confidence (0~1)")
     p.add_argument("--mp_refine_landmarks", action="store_true", default=True,
                    help="홍채/입술 정밀 랜드마크 사용(정확도↑, 연산↑)")
 
