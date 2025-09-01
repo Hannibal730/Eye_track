@@ -355,7 +355,7 @@ class SharedState:
         self.vis_mesh=False
         self.vis_iris=True
         self.vis_eye_axes=True           # Eye axes (fixed len)
-        self.vis_eye_axes_scaled=True    # Eye axes (eye len)
+        self.vis_eye_axes_scaled=False    # Eye axes (eye len)
         self.vis_uv_vectors=False
         self.vis_uv_vectors_bigger=True
         self.uv_bigger_gain=4.0
@@ -529,10 +529,10 @@ class ControlPanel(QtWidgets.QWidget):
         gl = QtWidgets.QGridLayout(grp)
         self.cb_mesh        = QtWidgets.QCheckBox("Face Mesh");            self.cb_mesh.setChecked(False)
         self.cb_iris        = QtWidgets.QCheckBox("Iris centers");         self.cb_iris.setChecked(True)
-        self.cb_axes   = QtWidgets.QCheckBox('Eye axes (fixed length; u_hat, v_hat)')
-        self.cb_axes_s = QtWidgets.QCheckBox('Eye axes (eye scaled length; s_u, s_v)')
-        self.cb_uvvec       = QtWidgets.QCheckBox("u/v vectors");          self.cb_uvvec.setChecked(False)
-        self.cb_uvvec_big   = QtWidgets.QCheckBox("u/v vectors (bigger)"); self.cb_uvvec_big.setChecked(True)
+        self.cb_axes   = QtWidgets.QCheckBox('Eye axes (fixed length; u_hat, v_hat)');   self.cb_axes.setChecked(True)
+        self.cb_axes_s = QtWidgets.QCheckBox('Eye axes (eye scaled length; s_u, s_v)');  self.cb_axes_s.setChecked(False)
+        self.cb_uvvec       = QtWidgets.QCheckBox("u, v vectors");          self.cb_uvvec.setChecked(False)
+        self.cb_uvvec_big   = QtWidgets.QCheckBox("u, v vectors (bigger)"); self.cb_uvvec_big.setChecked(True)
         self.sb_uv_gain     = QtWidgets.QDoubleSpinBox(); self.sb_uv_gain.setRange(0.1,20.0); self.sb_uv_gain.setSingleStep(0.1); self.sb_uv_gain.setDecimals(1); self.sb_uv_gain.setValue(4.0)
         self.cb_cnt_pts     = QtWidgets.QCheckBox("Eye contour points");   self.cb_cnt_pts.setChecked(False)
         self.cb_cnt_edges   = QtWidgets.QCheckBox("Eye contour edges");    self.cb_cnt_edges.setChecked(True)
@@ -540,7 +540,7 @@ class ControlPanel(QtWidgets.QWidget):
         gl.addWidget(self.cb_iris,       1,0)
         gl.addWidget(self.cb_axes,       2,0); gl.addWidget(self.cb_axes_s,     2,1)
         gl.addWidget(self.cb_uvvec,      3,0); gl.addWidget(self.cb_uvvec_big,  3,1)
-        gl.addWidget(QtWidgets.QLabel("u/v bigger gain"), 4,0); gl.addWidget(self.sb_uv_gain, 4,1)
+        gl.addWidget(QtWidgets.QLabel("u/v bigger times"), 4,0); gl.addWidget(self.sb_uv_gain, 4,1)
         gl.addWidget(self.cb_cnt_pts,    5,0); gl.addWidget(self.cb_cnt_edges,  5,1)
 
         # Smoothing 묶음 → 이름 변경
@@ -778,8 +778,8 @@ class GazeWorker(threading.Thread):
                         self._draw_points(out, l_eye_pts_xy, (0,255,255), r=2)
                         self._draw_points(out, r_eye_pts_xy, (0,255,255), r=2)
                     if vis_cnt_edges:
-                        self._draw_edges(out, mp_face_mesh.FACEMESH_LEFT_EYE,  lms, W, H, color=(0,200,255), thickness=1)
-                        self._draw_edges(out, mp_face_mesh.FACEMESH_RIGHT_EYE, lms, W, H, color=(0,200,255), thickness=1)
+                        self._draw_edges(out, mp_face_mesh.FACEMESH_LEFT_EYE,  lms, W, H, color=(0,0,255), thickness=1)
+                        self._draw_edges(out, mp_face_mesh.FACEMESH_RIGHT_EYE, lms, W, H, color=(0,0,255), thickness=1)
 
                 # 캘리브 타깃 비디오 프레임
                 with self.shared.lock: want_video = bool(self.shared.use_video_target)
