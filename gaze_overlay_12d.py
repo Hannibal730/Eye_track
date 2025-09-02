@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-gaze_overlay_12d.py
+gaze_overlay_12d.py  (video/audio 타깃 제거판)
 - MediaPipe Face Mesh(iris 포함)로 12D 시선 피처 추출(uL,vL,uR,vR + 2차 확장)
 - 캘리브레이션: 그리드(행x열, 지그재그), 포인트당 체류시간 수집
-- 타깃: 비디오 프레임을 포인트 중앙에 재생(+선택적 오디오)
 - 데이터 저장: data/gaze_samples_*.npz (X,Y,T,pt_index,screen,feature_names,meta)
 - 모델: 릿지 선형(.pkl/.npz 로드)
 - 스무딩: OneEuro + EMA
 - 시각화(토글): FaceMesh/홍채 중심/홍채 4점 엣지/축/u-v 벡터/눈 컨투어 점+엣지
-- UI: Calibration 설정, Calibration target(video), Calibration Module(시각화),
-      Calibration Audio(오디오), Calibration Command(시작/중지/로드/토글), Smoothing Factors, Quit
+- UI: Calibration 설정, Calibration Command(시작/중지/로드/오버레이), Visualization, Smoothing Factors, Quit
+
+주의:
+- 이 버전은 '캘리브레이션 타깃 동영상/오디오 재생'만 제거했습니다. 그 외 기능 동일.
 """
 
-import os, sys, time, argparse, re, threading, json, subprocess, shutil, inspect
+import os, sys, time, argparse, re, threading, json, inspect
 import numpy as np
 import cv2
 import mediapipe as mp
@@ -28,10 +29,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR   = os.path.join(HERE, "data")
 MODELS_DIR = os.path.join(HERE, "models")
-VIDEOS_DIR = os.path.join(HERE, "videos")
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(MODELS_DIR, exist_ok=True)
-os.makedirs(VIDEOS_DIR, exist_ok=True)
 
 # -------------------- MediaPipe --------------------
 mp_drawing         = mp.solutions.drawing_utils
@@ -64,7 +63,7 @@ def _pca_axes(pts: np.ndarray):
     X = pts - c
     U, S, Vt = np.linalg.svd(X, full_matrices=False)
     ax1, ax2 = Vt[0], Vt[1]
-    # 축 길이(반경)
+    # 축 길이(반경): 분산 기반(안정화용 epsilon 포함)
     su = 2 * (np.sqrt(np.mean((X @ ax1)**2)) + 1e-6) / 2.0
     sv = 2 * (np.sqrt(np.mean((X @ ax2)**2)) + 1e-6) / 2.0
     return c, ax1, ax2, su, sv
@@ -242,114 +241,6 @@ class OneEuro:
         self.x_prev=x_hat; self.dx_prev=dx_hat; self.t_prev=t
         return x_hat
 
-# -------------------- 비디오/오디오 --------------------
-class VideoSource:
-    def __init__(self, path:str, out_width:int=320, use_cuda:bool=True):
-        self.path=path; self.cap=None
-        self.out_w=int(max(64,out_width)); self.out_h=None
-        self.use_cuda = (use_cuda and hasattr(cv2,"cuda") and cv2.cuda.getCudaEnabledDeviceCount()>0)
-        self.fps=30.0; self.frame_dt=1.0/self.fps
-        self.base_t=None; self.cur_idx=0
-        self._open()
-    def _open(self):
-        self.cap = cv2.VideoCapture(self.path)
-        if not self.cap.isOpened(): raise FileNotFoundError(f"Cannot open video: {self.path}")
-        w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
-        h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 360
-        ar = w/max(1,h); self.out_h = int(round(self.out_w/ar))
-        fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 0.0)
-        if not np.isfinite(fps) or fps<=1.0: fps=30.0
-        self.fps=fps; self.frame_dt=1.0/fps; self.cur_idx=0
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    def set_base_time(self, t0=None):
-        self.base_t=float(t0 if t0 is not None else time.monotonic())
-        self.cur_idx=0; self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    def _resize(self, frame):
-        if self.use_cuda:
-            try:
-                gpu=cv2.cuda_GpuMat(); gpu.upload(frame)
-                r=cv2.cuda.resize(gpu,(self.out_w,self.out_h))
-                return r.download()
-            except Exception:
-                pass
-        return cv2.resize(frame,(self.out_w,self.out_h),interpolation=cv2.INTER_AREA)
-    def read(self):
-        if self.base_t is not None:
-            elapsed = time.monotonic() - self.base_t
-            target  = int(elapsed*self.fps)
-            while self.cur_idx < target:
-                ok = self.cap.grab()
-                if not ok:
-                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0); self.cur_idx=0; continue
-                self.cur_idx += 1
-            ahead = (self.cur_idx - target)
-            if ahead>0:
-                time.sleep(min(ahead*self.frame_dt, 0.02))
-        ok, frame = self.cap.read()
-        if not ok:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0); self.cur_idx=0
-            ok, frame = self.cap.read()
-            if not ok: return False, None
-        self.cur_idx += 1
-        return True, self._resize(frame)
-
-class AudioManager:
-    def __init__(self):
-        self.backend=None; self.vlc_mod=None; self.vlc_player=None
-        self.ffplay_path = shutil.which("ffplay")
-        try:
-            import vlc
-            self.vlc_mod = vlc; self.backend="vlc"
-        except Exception:
-            self.vlc_mod=None; self.backend = "ffplay" if self.ffplay_path else None
-        self._stop_evt = threading.Event(); self.proc=None; self.thread=None
-        self.loop=True; self.volume=80
-    def start(self, path:str, loop=True, volume=80):
-        self.stop(); self.loop=bool(loop); self.volume=int(max(0,min(100,volume)))
-        if self.backend=="vlc":
-            vlc=self.vlc_mod
-            try:
-                inst = vlc.Instance("--no-xlib","--intf","dummy","--no-video")
-                p = inst.media_player_new(); m = inst.media_new(path); p.set_media(m)
-                p.audio_set_volume(self.volume); self._stop_evt.clear()
-                def _end(_):
-                    if not self._stop_evt.is_set() and self.loop:
-                        try: p.stop(); p.play()
-                        except Exception: pass
-                p.event_manager().event_attach(vlc.EventType.MediaPlayerEndReached, _end)
-                p.play(); self.vlc_player=p
-            except Exception: self.vlc_player=None
-        elif self.backend=="ffplay" and self.ffplay_path:
-            self._stop_evt.clear()
-            def _run():
-                while not self._stop_evt.is_set():
-                    cmd=[self.ffplay_path,"-nodisp","-autoexit","-loglevel","error","-volume",str(self.volume),path]
-                    try:
-                        self.proc=subprocess.Popen(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-                        self.proc.wait()
-                    except Exception: break
-                    if not self.loop or self._stop_evt.is_set(): break
-            self.thread=threading.Thread(target=_run,daemon=True); self.thread.start()
-    def stop(self):
-        self._stop_evt.set()
-        if self.vlc_player is not None:
-            try: self.vlc_player.stop()
-            except Exception: pass
-            self.vlc_player=None
-        if self.proc is not None:
-            try: self.proc.terminate()
-            except Exception: pass
-            self.proc=None
-        if self.thread is not None:
-            try: self.thread.join(timeout=0.2)
-            except Exception: pass
-            self.thread=None
-    def set_volume(self, vol:int):
-        self.volume=int(max(0,min(100,vol)))
-        if self.backend=="vlc" and self.vlc_player is not None:
-            try: self.vlc_player.audio_set_volume(self.volume)
-            except Exception: pass
-
 # -------------------- 공유 상태 --------------------
 class SharedState:
     def __init__(self, sw:int, sh:int):
@@ -365,9 +256,9 @@ class SharedState:
         # 시각화 옵션
         self.vis_mesh=False
         self.vis_iris=True                 # 홍채 중심점
-        self.vis_iris_quad=True           # (신규) 홍채 4점 엣지
+        self.vis_iris_quad=True            # (신규) 홍채 4점 엣지
         self.vis_eye_axes=True             # Eye axes (fixed len: û, v̂)
-        self.vis_eye_axes_scaled=False      # Eye axes (eye len: s_u, s_v)
+        self.vis_eye_axes_scaled=False     # Eye axes (eye len: s_u, s_v)
         self.vis_uv_vectors=False
         self.vis_uv_vectors_bigger=True
         self.uv_bigger_gain=4.0
@@ -377,14 +268,6 @@ class SharedState:
         # 스무딩
         self.ema_alpha=0.8
         self.oe_mincutoff=0.20; self.oe_beta=0.003; self.oe_dcutoff=1.0
-
-        # 비디오/오디오
-        self.use_video_target=True
-        self.calib_video_path=False
-        self.video_frame=None
-        self.video_size=(320,180)
-        self.cuda_enabled=True   # 기본값 True (미지원 시 자동 CPU fallback)
-        self.audio_enabled=True; self.audio_volume=80; self.audio_backend="auto"
 
         # 명령
         self.cmd={"start_calib":False,"stop_calib":False,"load_model":False,
@@ -408,7 +291,7 @@ class OverlayWindow(QtWidgets.QWidget):
         super().__init__(None)
         self.shared=shared; self.app=app
         self.status="Gaze Overlay"; self.substatus="Use Control Panel"
-        self.cross=None; self.calib_target=None; self._vid_img=None
+        self.cross=None; self.calib_target=None
 
         flags = (QtCore.Qt.WindowStaysOnTopHint | QtCore.Qt.FramelessWindowHint |
                  QtCore.Qt.Tool | QtCore.Qt.WindowDoesNotAcceptFocus)
@@ -424,19 +307,12 @@ class OverlayWindow(QtWidgets.QWidget):
         self.timer=QtCore.QTimer(self); self.timer.timeout.connect(self.tick); self.timer.start(16)
         self.show()
 
-    def _bgr_to_qimage(self, bgr: np.ndarray) -> QtGui.QImage:
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        h, w = rgb.shape[:2]
-        return QtGui.QImage(rgb.data, w, h, 3*w, QtGui.QImage.Format_RGB888).copy()
-
     def tick(self):
         with self.shared.lock:
             self.cross=self.shared.cross
             self.calib_target=self.shared.calib_target
             enabled=self.shared.overlay_enabled
             self.status=self.shared.status; self.substatus=self.shared.substatus
-            vf=self.shared.video_frame
-        self._vid_img = self._bgr_to_qimage(vf) if vf is not None else None
 
         if enabled:
             if not self.isVisible(): self.setAttribute(QtCore.Qt.WA_ShowWithoutActivating, True); self.show()
@@ -451,16 +327,13 @@ class OverlayWindow(QtWidgets.QWidget):
         pen = QtGui.QPen(QtGui.QColor(160,160,160,200), 1); p.setPen(pen)
         p.setFont(QtGui.QFont("Arial", 12)); p.drawText(30,80,self.substatus)
 
+        # 캘리브 타깃: 주황색 고리
         if self.calib_target is not None:
             tx, ty = self.calib_target
-            if self._vid_img is not None:
-                w=self._vid_img.width(); h=self._vid_img.height()
-                x1=int(tx-w/2); y1=int(ty-h/2)
-                p.drawImage(QtCore.QPoint(x1,y1), self._vid_img)
-            else:
-                pen=QtGui.QPen(QtGui.QColor(255,165,0,240), 4); p.setPen(pen)
-                p.setBrush(QtCore.Qt.NoBrush); p.drawEllipse(QtCore.QPointF(tx,ty), 16, 16)
+            pen=QtGui.QPen(QtGui.QColor(255,165,0,240), 4); p.setPen(pen)
+            p.setBrush(QtCore.Qt.NoBrush); p.drawEllipse(QtCore.QPointF(tx,ty), 16, 16)
 
+        # 추정점: 빨간 고리
         with self.shared.lock: cross=self.shared.cross
         if cross is not None:
             x,y=cross; pen=QtGui.QPen(QtGui.QColor(255,0,0,230), 4)
@@ -490,37 +363,6 @@ class ControlPanel(QtWidgets.QWidget):
         self.sb_cols.valueChanged.connect(lambda v_: self._set("calib_cols", int(v_)))
         self.sb_per .valueChanged.connect(lambda v_: self._set("calib_per_point", float(v_)))
 
-        # Calibration target (video)
-        grpV = QtWidgets.QGroupBox("Calibration target (video)"); v.addWidget(grpV)
-        gv = QtWidgets.QGridLayout(grpV)
-        self.cb_usevid = QtWidgets.QCheckBox("Use video target"); self.cb_usevid.setChecked(True)
-        self.btn_pick  = QtWidgets.QPushButton("Pick video...")
-        self.sb_width  = QtWidgets.QSpinBox(); self.sb_width.setRange(80,1280); self.sb_width.setSingleStep(10); self.sb_width.setValue(320)
-        self.cb_cuda   = QtWidgets.QCheckBox("Use CUDA if available"); self.cb_cuda.setChecked(True)  # 기본 True
-        gv.addWidget(self.cb_usevid,0,0,1,2)
-        gv.addWidget(QtWidgets.QLabel("Video width (px)"),1,0); gv.addWidget(self.sb_width,1,1)
-        gv.addWidget(self.cb_cuda,2,0,1,2)
-        gv.addWidget(self.btn_pick,3,0,1,2)
-        self.cb_usevid.toggled.connect(lambda v_: self._set("use_video_target", bool(v_)))
-        self.cb_cuda  .toggled.connect(lambda v_: self._set("cuda_enabled", bool(v_)))
-        self.sb_width.valueChanged.connect(lambda val: self._set_video_width(int(val)))
-        self.btn_pick.clicked.connect(self._pick_video)
-
-
-
-        # Calibration Audio
-        grpA = QtWidgets.QGroupBox("Calibration Audio")
-        v.addWidget(grpA)
-        ga = QtWidgets.QGridLayout(grpA)
-        self.cb_audio = QtWidgets.QCheckBox("Play audio during calibration"); self.cb_audio.setChecked(True)
-        self.sl_vol   = QtWidgets.QSlider(QtCore.Qt.Horizontal); self.sl_vol.setRange(0,100); self.sl_vol.setValue(80)
-        self.lbl_vol  = QtWidgets.QLabel("80"); self.lbl_backend = QtWidgets.QLabel("(backend: auto)")
-        ga.addWidget(self.cb_audio,0,0,1,2)
-        ga.addWidget(QtWidgets.QLabel("Volume"),1,0); ga.addWidget(self.sl_vol,1,1); ga.addWidget(self.lbl_vol,1,2)
-        ga.addWidget(self.lbl_backend,2,0,1,3)
-        self.cb_audio.toggled.connect(lambda v_: self._set("audio_enabled", bool(v_)))
-        self.sl_vol.valueChanged.connect(self._on_vol_changed)
-
         # === Calibration Command 그룹 ===
         grpCmd = QtWidgets.QGroupBox("Calibration Command")
         glcmd  = QtWidgets.QGridLayout(grpCmd)
@@ -532,24 +374,23 @@ class ControlPanel(QtWidgets.QWidget):
         glcmd.addWidget(b_stop,  0, 1)
         glcmd.addWidget(b_load,  1, 0)
         glcmd.addWidget(b_ov,    1, 1)
-
         b_calib.clicked.connect(lambda: self.shared.set_cmd("start_calib"))
         b_stop .clicked.connect(lambda: self.shared.set_cmd("stop_calib"))
         b_load .clicked.connect(self._choose_and_load_model)
         b_ov   .clicked.connect(lambda: self.shared.set_cmd("toggle_overlay"))
         v.addWidget(grpCmd)
-        
-        # Visualization 묶음 
+
+        # Visualization 묶음
         grp = QtWidgets.QGroupBox("Visualization"); v.addWidget(grp)
         gl = QtWidgets.QGridLayout(grp)
         self.cb_mesh        = QtWidgets.QCheckBox("Face Mesh");            self.cb_mesh.setChecked(False)
         self.cb_iris        = QtWidgets.QCheckBox("Iris centers");         self.cb_iris.setChecked(True)
-        self.cb_iris_quad   = QtWidgets.QCheckBox("Iris 4-edges");    self.cb_iris_quad.setChecked(True)
-        self.cb_axes   = QtWidgets.QCheckBox('Eye axes (fixed length; u_hat, v_hat)');   self.cb_axes.setChecked(True)
-        self.cb_axes_s = QtWidgets.QCheckBox('Eye axes (eye scaled length; s_u, s_v)');  self.cb_axes_s.setChecked(False)
+        self.cb_iris_quad   = QtWidgets.QCheckBox("Iris 4-edges");         self.cb_iris_quad.setChecked(True)
+        self.cb_axes        = QtWidgets.QCheckBox('Eye axes (fixed length; u_hat, v_hat)');   self.cb_axes.setChecked(True)
+        self.cb_axes_s      = QtWidgets.QCheckBox('Eye axes (eye scaled length; s_u, s_v)');  self.cb_axes_s.setChecked(False)
         self.cb_uvvec       = QtWidgets.QCheckBox("u, v vectors");          self.cb_uvvec.setChecked(False)
         self.cb_uvvec_big   = QtWidgets.QCheckBox("u, v vectors (bigger)"); self.cb_uvvec_big.setChecked(True)
-        self.sb_uv_gain     = QtWidgets.QDoubleSpinBox(); self.sb_uv_gain.setRange(0.1,20.0); self.sb_uv_gain.setSingleStep(0.1); self.sb_uv_gain.setDecimals(1); self.sb_uv_gain.setValue(4.0)
+        self.sb_uv_gain     = QtWidgets.QDoubleSpinBox(); self.sb_uv_gain.setRange(0.1,100.0); self.sb_uv_gain.setSingleStep(0.1); self.sb_uv_gain.setDecimals(1); self.sb_uv_gain.setValue(4.0)
         self.cb_cnt_pts     = QtWidgets.QCheckBox("Eye contour points");   self.cb_cnt_pts.setChecked(False)
         self.cb_cnt_edges   = QtWidgets.QCheckBox("Eye contour edges");    self.cb_cnt_edges.setChecked(True)
         gl.addWidget(self.cb_mesh,       0,0)
@@ -559,7 +400,7 @@ class ControlPanel(QtWidgets.QWidget):
         gl.addWidget(QtWidgets.QLabel("u/v bigger times"), 4,0); gl.addWidget(self.sb_uv_gain, 4,1)
         gl.addWidget(self.cb_cnt_pts,    5,0); gl.addWidget(self.cb_cnt_edges,  5,1)
 
-        # Smoothing 묶음 → 이름 변경
+        # Smoothing 묶음
         grp2 = QtWidgets.QGroupBox("Smoothing Factors"); v.addWidget(grp2)
         g2 = QtWidgets.QGridLayout(grp2)
         g2.addWidget(QtWidgets.QLabel("OneEuro mincutoff"), 0,0)
@@ -601,18 +442,9 @@ class ControlPanel(QtWidgets.QWidget):
 
     def _set(self,name,val):
         with self.shared.lock: setattr(self.shared,name,val)
-    def _pick_video(self):
-        fname,_=QtWidgets.QFileDialog.getOpenFileName(self,"Select video",VIDEOS_DIR,"Video files (*.mp4 *.mov *.avi *.mkv);;All files (*)")
-        if fname:
-            with self.shared.lock: self.shared.calib_video_path=fname
-    def _set_video_width(self,w:int):
-        with self.shared.lock: self.shared.video_size=(int(w), max(60,int(w*9/16)))
     def _choose_and_load_model(self):
         fname,_=QtWidgets.QFileDialog.getOpenFileName(self,"Select model file",MODELS_DIR,"Model files (*.npz *.pkl);;All files (*)")
         if fname: self.shared.set_load_model(fname)
-    def _on_vol_changed(self,v:int):
-        self.lbl_vol.setText(str(int(v)))
-        with self.shared.lock: self.shared.audio_volume=int(v)
 
 # -------------------- FaceMesh 빌더(안전한 인자 필터) --------------------
 def build_facemesh(args):
@@ -636,28 +468,11 @@ class GazeWorker(threading.Thread):
         self.stop_flag=threading.Event()
         self.oe = OneEuro(mincutoff=float(args.oe_mincutoff), beta=float(args.oe_beta), dcutoff=float(args.oe_dcutoff))
         self.ema_last=None
-        self.vid=None; self.audio=AudioManager()
         self.calib=Calibrator(shared.screen_w, shared.screen_h, 0,0, args.margin, args.per_point)
-        with self.shared.lock: self.shared.audio_backend = self.audio.backend or "none"
 
         # su/sv 안정화를 위한 히스토리(필요 시 활용)
         self.su_hist_L = deque(maxlen=120); self.sv_hist_L = deque(maxlen=120)
         self.su_hist_R = deque(maxlen=120); self.sv_hist_R = deque(maxlen=120)
-
-    def _ensure_video(self):
-        with self.shared.lock:
-            use = self.shared.use_video_target; vpath = self.shared.calib_video_path
-            vw,vh = self.shared.video_size; use_cuda = self.shared.cuda_enabled
-        if use and vpath and os.path.isfile(vpath):
-            try:
-                self.vid = VideoSource(vpath, out_width=vw, use_cuda=use_cuda)
-                with self.shared.lock: self.shared.video_size=(self.vid.out_w,self.vid.out_h)
-                return True
-            except Exception as e:
-                print("[Video] open failed:", e); self.vid=None
-        else:
-            self.vid=None
-        return False
 
     def _start_new_calibration(self):
         with self.shared.lock:
@@ -665,14 +480,9 @@ class GazeWorker(threading.Thread):
             perp=float(self.shared.calib_per_point); margin=float(self.shared.calib_margin)
         self.calib = Calibrator(self.shared.screen_w, self.shared.screen_h, rows, cols, margin, perp)
         self.calib.begin()
-        with self.shared.lock:
-            audio_enabled=bool(self.shared.audio_enabled); audio_volume=int(self.shared.audio_volume); vpath=self.shared.calib_video_path
-        if audio_enabled and vpath and os.path.isfile(vpath): self.audio.start(vpath, loop=True, volume=audio_volume)
-        if self.vid is not None: self.vid.set_base_time(time.monotonic())
 
     def _stop_calibration(self, save=False):
         if self.calib and self.calib.collecting: self.calib.collecting=False
-        self.audio.stop()
         with self.shared.lock:
             self.shared.calibrating=False; self.shared.calib_target=None
             self.shared.substatus = "Calibration stopped" if not save else "Calibration saved"
@@ -712,8 +522,6 @@ class GazeWorker(threading.Thread):
         fc_str = "".join([chr((fourcc_v >> 8*i) & 0xFF) for i in range(4)])
         print(f"[CAM] {real_w}x{real_h} @ {real_fps:.1f} FPS, FourCC={fc_str}")
 
-        self._ensure_video()
-
         # FaceMesh 생성(안전한 인자만 전달)
         with build_facemesh(self.args) as face_mesh:
             while not self.stop_flag.is_set():
@@ -733,8 +541,6 @@ class GazeWorker(threading.Thread):
                     self.oe.mincutoff=float(self.args.oe_mincutoff)
                     self.oe.beta     =float(self.args.oe_beta)
                     self.oe.dcutoff  =float(self.args.oe_dcutoff)
-
-                    want_video     = bool(self.shared.use_video_target)
 
                 ok, frame = cap.read()
                 if not ok: continue
@@ -764,28 +570,25 @@ class GazeWorker(threading.Thread):
 
                     # 홍채 중심
                     if vis_iris:
-                        cv2.circle(out,(int(icL[0]),int(icL[1])),3,(255,255,0),-1) # radius=3
+                        cv2.circle(out,(int(icL[0]),int(icL[1])),3,(255,255,0),-1)
                         cv2.circle(out,(int(icR[0]),int(icR[1])),3,(255,255,0),-1)
 
                     # (신규) 홍채 4점 엣지
                     if vis_iris_quad:
                         ptsL = np.array([(lms[i].x * W, lms[i].y * H) for i in LEFT_IRIS_IDXS],  dtype=np.float32)
                         ptsR = np.array([(lms[i].x * W, lms[i].y * H) for i in RIGHT_IRIS_IDXS], dtype=np.float32)
-                        for pts, color in [(ptsL, (255,255,0)), 
-                                           (ptsR, (255,255,0))]: # 청록(Right)
+                        for pts, color in [(ptsL, (255,255,0)), (ptsR, (255,255,0))]:
                             ordered = _order_quad_clockwise(pts)
                             poly    = ordered.astype(np.int32).reshape(-1,1,2)
                             cv2.polylines(out, [poly], isClosed=True, color=color, thickness=1, lineType=cv2.LINE_AA)
 
-
-                    # 고정 길이 축: 왼쪽/오른쪽 서로 다르게
+                    # 고정 길이 축: 왼쪽/오른쪽 서로 다르게(색/두께/길이 커스터마이즈 예시)
                     if vis_axes:
-                        # --- 왼쪽 눈 설정 ---
-                        L_L     = 25                 # 왼쪽 축 길이(px)
-                        col_u_L = (0, 225, 0)        # 왼쪽 u-축 색 (BGR)
-                        col_v_L = (0, 255, 0)        # 왼쪽 v-축 색 (BGR)
-                        th_L    = 1                  # 왼쪽 선 두께
-
+                        # --- 왼쪽 눈 ---
+                        L_L     = 25
+                        col_u_L = (0, 225, 0)
+                        col_v_L = (0, 255, 0)
+                        th_L    = 1
                         cv2.line(out,
                                 (int(cL[0] - ax1L[0]*L_L), int(cL[1] - ax1L[1]*L_L)),
                                 (int(cL[0] + ax1L[0]*L_L), int(cL[1] + ax1L[1]*L_L)),
@@ -794,13 +597,11 @@ class GazeWorker(threading.Thread):
                                 (int(cL[0] - ax2L[0]*L_L), int(cL[1] - ax2L[1]*L_L)),
                                 (int(cL[0] + ax2L[0]*L_L), int(cL[1] + ax2L[1]*L_L)),
                                 col_v_L, th_L, cv2.LINE_AA)
-
-                        # --- 오른쪽 눈 설정 ---
-                        L_R     = 25                 # 오른쪽 축 길이(px) — 왼쪽과 다르게
-                        col_u_R = (0, 0, 255)      # 오른쪽 u-축 색 (BGR)
-                        col_v_R = (0, 0, 255)      # 오른쪽 v-축 색 (BGR)
-                        th_R    = 1                  # 오른쪽 선 두께
-
+                        # --- 오른쪽 눈 ---
+                        L_R     = 25
+                        col_u_R = (0, 0, 255)
+                        col_v_R = (0, 0, 255)
+                        th_R    = 1
                         cv2.line(out,
                                 (int(cR[0] - ax1R[0]*L_R), int(cR[1] - ax1R[1]*L_R)),
                                 (int(cR[0] + ax1R[0]*L_R), int(cR[1] + ax1R[1]*L_R)),
@@ -808,9 +609,9 @@ class GazeWorker(threading.Thread):
                         cv2.line(out,
                                 (int(cR[0] - ax2R[0]*L_R), int(cR[1] - ax2R[1]*L_R)),
                                 (int(cR[0] + ax2R[0]*L_R), int(cR[1] + ax2R[1]*L_R)),
-                                col_v_R, th_R, cv2.LINE_AA)        
-                            
-                            
+                                col_v_R, th_R, cv2.LINE_AA)
+
+                    # 눈 크기 비례 축
                     if vis_axes_s:
                         for c,a1,a2,su,sv in [(cL,ax1L,ax2L,suL,svL),(cR,ax1R,ax2R,suR,svR)]:
                             cv2.line(out,(int(c[0]-a1[0]*su),int(c[1]-a1[1]*su)),(int(c[0]+a1[0]*su),int(c[1]+a1[1]*su)),(255,0,255),1,cv2.LINE_AA)
@@ -837,15 +638,6 @@ class GazeWorker(threading.Thread):
                         self._draw_edges(out, mp_face_mesh.FACEMESH_LEFT_EYE,  lms, W, H, color=(0,255,0), thickness=1)
                         self._draw_edges(out, mp_face_mesh.FACEMESH_RIGHT_EYE, lms, W, H, color=(0,0,255), thickness=1)
 
-                # 캘리브 타깃 비디오 프레임
-                with self.shared.lock: want_video = bool(self.shared.use_video_target)
-                if want_video and self.vid is None: self._ensure_video()
-                if want_video and self.vid is not None:
-                    okv, vframe = self.vid.read()
-                    with self.shared.lock: self.shared.video_frame = (vframe if okv else None)
-                else:
-                    with self.shared.lock: self.shared.video_frame = None
-
                 # 명령 처리
                 if self.shared.pop_cmd("quit"): self.stop_flag.set(); break
                 if self.shared.pop_cmd("start_calib"): self._start_new_calibration()
@@ -870,7 +662,7 @@ class GazeWorker(threading.Thread):
                     if gaze_feat is not None: finished = self.calib.feed(gaze_feat, t_now=time.time())
                     with self.shared.lock:
                         self.shared.calibrating=True; self.shared.calib_target=target_px
-                        self.shared.status=f"Calibration {self.calib.idx+1}/{self.calib.n_points()}"; self.shared.substatus="표시되는 영상 중앙을 응시하세요"
+                        self.shared.status=f"Calibration {self.calib.idx+1}/{self.calib.n_points()}"; self.shared.substatus="표시되는 원(고리)의 중심을 응시하세요"
                         self.shared.cross=None
                     if finished:
                         self.calib.save_model_pkl()
@@ -879,7 +671,6 @@ class GazeWorker(threading.Thread):
                             "per_point_sec": float(self.calib.per_point_sec), "camera_index": int(self.args.camera),
                             "mirror_preview": bool(self.args.mirror_preview)
                         })
-                        self.audio.stop()
                         with self.shared.lock:
                             self.shared.calibrating=False; self.shared.calib_target=None
                             self.shared.status="Calibrated & saved data"; self.shared.substatus=f"Saved: {os.path.basename(ds_path)}"
@@ -910,13 +701,13 @@ class GazeWorker(threading.Thread):
                 else:
                     time.sleep(0.001)
 
-        self.audio.stop(); cap.release(); cv2.destroyAllWindows()
+        cap.release(); cv2.destroyAllWindows()
 
     def stop(self): self.stop_flag.set()
 
 # -------------------- 인자 --------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="MediaPipe FaceMesh + PyQt gaze overlay (12D) with video/audio target")
+    p = argparse.ArgumentParser(description="MediaPipe FaceMesh + PyQt gaze overlay (12D)")
     # 기존 인자
     p.add_argument("--grid", type=str, default="", help="예: '4,8' 또는 '4x8'")
     p.add_argument("--rows", type=int, default=0); p.add_argument("--cols", type=int, default=0)
