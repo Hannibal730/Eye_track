@@ -9,9 +9,6 @@ gaze_overlay_12d.py  (video/audio 타깃 제거판)
 - 스무딩: OneEuro + EMA
 - 시각화(토글): FaceMesh/홍채 중심/홍채 4점 엣지/축/u-v 벡터/눈 컨투어 점+엣지
 - UI: Calibration 설정, Calibration Command(시작/중지/로드/오버레이), Visualization, Smoothing Factors, Quit
-
-주의:
-- 이 버전은 '캘리브레이션 타깃 동영상/오디오 재생'만 제거했습니다. 그 외 기능 동일.
 """
 
 import os, sys, time, argparse, re, threading, json, inspect
@@ -256,12 +253,12 @@ class SharedState:
         # 시각화 옵션
         self.vis_mesh=False
         self.vis_iris=True                 # 홍채 중심점
-        self.vis_iris_quad=True            # (신규) 홍채 4점 엣지
+        self.vis_iris_quad=True            # 홍채 4점 엣지
         self.vis_eye_axes=True             # Eye axes (fixed len: û, v̂)
         self.vis_eye_axes_scaled=False     # Eye axes (eye len: s_u, s_v)
         self.vis_uv_vectors=False
         self.vis_uv_vectors_bigger=True
-        self.uv_bigger_gain=4.0
+        self.uv_bigger_gain=25.0
         self.vis_eye_contour_pts   = False
         self.vis_eye_contour_edges = True
 
@@ -389,15 +386,15 @@ class ControlPanel(QtWidgets.QWidget):
         self.cb_axes        = QtWidgets.QCheckBox('Eye axes (fixed length; u_hat, v_hat)');   self.cb_axes.setChecked(True)
         self.cb_axes_s      = QtWidgets.QCheckBox('Eye axes (eye scaled length; s_u, s_v)');  self.cb_axes_s.setChecked(False)
         self.cb_uvvec       = QtWidgets.QCheckBox("u, v vectors");          self.cb_uvvec.setChecked(False)
-        self.cb_uvvec_big   = QtWidgets.QCheckBox("u, v vectors (bigger)"); self.cb_uvvec_big.setChecked(True)
-        self.sb_uv_gain     = QtWidgets.QDoubleSpinBox(); self.sb_uv_gain.setRange(0.1,100.0); self.sb_uv_gain.setSingleStep(0.1); self.sb_uv_gain.setDecimals(1); self.sb_uv_gain.setValue(4.0)
+        self.cb_uvvec_big   = QtWidgets.QCheckBox("u, v vectors (bigger for viz)"); self.cb_uvvec_big.setChecked(True)
+        self.sb_uv_gain     = QtWidgets.QDoubleSpinBox(); self.sb_uv_gain.setRange(0.1,100.0); self.sb_uv_gain.setSingleStep(0.1); self.sb_uv_gain.setDecimals(1); self.sb_uv_gain.setValue(25.0)
         self.cb_cnt_pts     = QtWidgets.QCheckBox("Eye contour points");   self.cb_cnt_pts.setChecked(False)
         self.cb_cnt_edges   = QtWidgets.QCheckBox("Eye contour edges");    self.cb_cnt_edges.setChecked(True)
         gl.addWidget(self.cb_mesh,       0,0)
         gl.addWidget(self.cb_iris,       1,0); gl.addWidget(self.cb_iris_quad,  1,1)
         gl.addWidget(self.cb_axes,       2,0); gl.addWidget(self.cb_axes_s,     2,1)
         gl.addWidget(self.cb_uvvec,      3,0); gl.addWidget(self.cb_uvvec_big,  3,1)
-        gl.addWidget(QtWidgets.QLabel("u/v bigger times"), 4,0); gl.addWidget(self.sb_uv_gain, 4,1)
+        gl.addWidget(QtWidgets.QLabel("u, v vectors bigger gain"), 4,0); gl.addWidget(self.sb_uv_gain, 4,1)
         gl.addWidget(self.cb_cnt_pts,    5,0); gl.addWidget(self.cb_cnt_edges,  5,1)
 
         # Smoothing 묶음
@@ -573,7 +570,7 @@ class GazeWorker(threading.Thread):
                         cv2.circle(out,(int(icL[0]),int(icL[1])),3,(255,255,0),-1)
                         cv2.circle(out,(int(icR[0]),int(icR[1])),3,(255,255,0),-1)
 
-                    # (신규) 홍채 4점 엣지
+                    # 홍채 4점 엣지
                     if vis_iris_quad:
                         ptsL = np.array([(lms[i].x * W, lms[i].y * H) for i in LEFT_IRIS_IDXS],  dtype=np.float32)
                         ptsR = np.array([(lms[i].x * W, lms[i].y * H) for i in RIGHT_IRIS_IDXS], dtype=np.float32)
@@ -623,8 +620,8 @@ class GazeWorker(threading.Thread):
                             base=(int(c[0]),int(c[1]))
                             if vis_uvvec:
                                 vec_u = a1*(u*su); vec_v = a2*(v*sv)
-                                cv2.arrowedLine(out, base, (base[0]+int(vec_u[0]), base[1]+int(vec_u[1])), (0,200,0),2,tipLength=0.3)
-                                cv2.arrowedLine(out, base, (base[0]+int(vec_v[0]), base[1]+int(vec_v[1])), (200,0,0),2,tipLength=0.3)
+                                cv2.arrowedLine(out, base, (base[0]+int(vec_u[0]), base[1]+int(vec_u[1])), (255,0,255),2,tipLength=0.3)
+                                cv2.arrowedLine(out, base, (base[0]+int(vec_v[0]), base[1]+int(vec_v[1])), (0,255,255),2,tipLength=0.3)
                             if vis_uvvec_big and uv_gain>0.0:
                                 big_u=a1*(u*su*uv_gain); big_v=a2*(v*sv*uv_gain)
                                 cv2.arrowedLine(out, base, (base[0]+int(big_u[0]), base[1]+int(big_u[1])), (255,0,255),3,tipLength=0.25)
