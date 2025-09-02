@@ -129,11 +129,12 @@ class Ridge2D:
         return (self.W @ X.T).T + self.b
 
 class Calibrator:
-    def __init__(self, screen_w, screen_h, rows=0, cols=0, margin=0.10, per_point_sec=2.0):
+    def __init__(self, screen_w, screen_h, rows=0, cols=0, margin=0.10, per_point_sec=2.0, delay_sec=0.5):
         self.sw, self.sh = screen_w, screen_h
         self.rows, self.cols, self.margin = rows, cols, margin
         self.points_norm = make_grid_points(rows, cols, margin, "serpentine") if (rows and cols) else FIVE_POINTS[:]
         self.per_point_sec = per_point_sec
+        self.delay_sec = float(delay_sec)
         self.reset()
         self.model = Ridge2D(alpha=10.0)
 
@@ -154,12 +155,17 @@ class Calibrator:
     def feed(self, feat, t_now=None):
         if not self.collecting: return False
         tx, ty = self.current_target_px()
-        self.samples_X.append(np.array(feat, dtype=np.float32))
-        self.samples_Y.append(np.array([tx, ty], dtype=np.float32))
-        self.samples_IDX.append(int(self.idx))
-        self.samples_T.append(float(time.time() if t_now is None else t_now))
-        if (time.time() - self.start_t) >= self.per_point_sec:
-            self.idx += 1; self.start_t = time.time()
+        tcur = float(time.time() if t_now is None else t_now)
+        # delay 경과 시에만 기록
+        if (tcur - self.start_t) >= self.delay_sec:   
+            self.samples_X.append(np.array(feat, dtype=np.float32))
+            self.samples_Y.append(np.array([tx, ty], dtype=np.float32))
+            self.samples_IDX.append(int(self.idx))
+            self.samples_T.append(tcur)
+
+        if (tcur - self.start_t) >= self.per_point_sec:
+            self.idx += 1
+            self.start_t = time.time()
             if self.idx >= len(self.points_norm):
                 self.model.fit(np.stack(self.samples_X), np.stack(self.samples_Y))
                 self.collecting = False
@@ -188,7 +194,7 @@ class Calibrator:
         T   = np.array(self.samples_T,  dtype=np.float64)
         IDX = np.array(self.samples_IDX, dtype=np.int32)
         meta = {"rows": self.rows, "cols": self.cols, "margin": float(self.margin),
-                "per_point_sec": float(self.per_point_sec), "n_points": int(len(self.points_norm)), "timestamp": ts}
+                "per_point_sec": float(self.per_point_sec), "delay_sec": float(self.delay_sec), "n_points": int(len(self.points_norm)), "timestamp": ts}
         if meta_extra: meta.update(meta_extra)
         np.savez(path, X=X, Y=Y, T=T, pt_index=IDX,
                  feature_names=np.array(FEATURE_NAMES, dtype=object),
@@ -249,6 +255,8 @@ class SharedState:
 
         # Calibration 설정(UI)
         self.calib_rows=8; self.calib_cols=12; self.calib_per_point=2.0; self.calib_margin=0.03
+        self.calib_delay_sec = 0.5   # 포인트 이동 후 수집 지연(초)
+        self.calib_ready = False     # delay 경과하여 수집 시작 가능한 상태
 
         # 시각화 옵션
         self.vis_mesh=False
@@ -324,11 +332,25 @@ class OverlayWindow(QtWidgets.QWidget):
         pen = QtGui.QPen(QtGui.QColor(160,160,160,200), 1); p.setPen(pen)
         p.setFont(QtGui.QFont("Arial", 12)); p.drawText(30,80,self.substatus)
 
+        with self.shared.lock:
+            is_calib = self.shared.calibrating
+            is_ready = bool(getattr(self.shared, 'calib_ready', False))
+        if is_calib:
+            p.fillRect(self.rect(), QtGui.QColor(0, 0, 0, 255))  # ← 전체 검정
+
         # 캘리브 타깃: 주황색 고리
         if self.calib_target is not None:
             tx, ty = self.calib_target
-            pen=QtGui.QPen(QtGui.QColor(255,165,0,240), 4); p.setPen(pen)
-            p.setBrush(QtCore.Qt.NoBrush); p.drawEllipse(QtCore.QPointF(tx,ty), 16, 16)
+            if is_ready:
+                # delay 지났으면 “속이 꽉 찬 원”
+                pen = QtGui.QPen(QtGui.QColor(255,165,0,255), 0)
+                p.setPen(pen); p.setBrush(QtGui.QColor(255,165,0,255))
+                p.drawEllipse(QtCore.QPointF(tx, ty), 16, 16)
+            else:
+                # delay 전에는 “주황색 고리”
+                pen = QtGui.QPen(QtGui.QColor(255,165,0,240), 4)
+                p.setPen(pen); p.setBrush(QtCore.Qt.NoBrush)
+                p.drawEllipse(QtCore.QPointF(tx, ty), 16, 16)
 
         # 추정점: 빨간 고리
         with self.shared.lock: cross=self.shared.cross
@@ -347,18 +369,26 @@ class ControlPanel(QtWidgets.QWidget):
 
         v = QtWidgets.QVBoxLayout(self)
 
-        # Calibration 설정
+        # Calibration grid
         grpC = QtWidgets.QGroupBox("Calibration Grid"); v.addWidget(grpC)
         gc = QtWidgets.QGridLayout(grpC)
         self.sb_rows = QtWidgets.QSpinBox(); self.sb_rows.setRange(1,100); self.sb_rows.setValue(self.shared.calib_rows)
         self.sb_cols = QtWidgets.QSpinBox(); self.sb_cols.setRange(1,100); self.sb_cols.setValue(self.shared.calib_cols)
-        self.sb_per  = QtWidgets.QDoubleSpinBox(); self.sb_per.setRange(0.1,10.0); self.sb_per.setSingleStep(0.1); self.sb_per.setDecimals(2); self.sb_per.setValue(self.shared.calib_per_point)
         gc.addWidget(QtWidgets.QLabel("Rows"),0,0); gc.addWidget(self.sb_rows,0,1)
         gc.addWidget(QtWidgets.QLabel("Columns"),1,0); gc.addWidget(self.sb_cols,1,1)
+        # calib sec
+        self.sb_per  = QtWidgets.QDoubleSpinBox(); self.sb_per.setRange(0.1,10.0); self.sb_per.setSingleStep(0.1); self.sb_per.setDecimals(2); self.sb_per.setValue(self.shared.calib_per_point)
+        self.sb_delay = QtWidgets.QDoubleSpinBox()
+        self.sb_delay.setRange(0.0, 10.0)
+        self.sb_delay.setDecimals(2)
+        self.sb_delay.setValue(self.shared.calib_delay_sec)
         gc.addWidget(QtWidgets.QLabel("Per-point (sec)"),2,0); gc.addWidget(self.sb_per,2,1)
+        gc.addWidget(QtWidgets.QLabel("Delay (sec)"), 3, 0); gc.addWidget(self.sb_delay, 3, 1)     
+        # 바인딩
         self.sb_rows.valueChanged.connect(lambda v_: self._set("calib_rows", int(v_)))
         self.sb_cols.valueChanged.connect(lambda v_: self._set("calib_cols", int(v_)))
         self.sb_per .valueChanged.connect(lambda v_: self._set("calib_per_point", float(v_)))
+        self.sb_delay.valueChanged.connect(lambda v_: self._set("calib_delay_sec", float(v_)))
 
         # === Calibration Command 그룹 ===
         grpCmd = QtWidgets.QGroupBox("Calibration Command")
@@ -474,9 +504,13 @@ class GazeWorker(threading.Thread):
     def _start_new_calibration(self):
         with self.shared.lock:
             rows=int(self.shared.calib_rows); cols=int(self.shared.calib_cols)
-            perp=float(self.shared.calib_per_point); margin=float(self.shared.calib_margin)
-        self.calib = Calibrator(self.shared.screen_w, self.shared.screen_h, rows, cols, margin, perp)
+            perp=float(self.shared.calib_per_point); margin=float(self.shared.calib_margin); dsec = float(self.shared.calib_delay_sec)
+        self.calib = Calibrator(self.shared.screen_w, self.shared.screen_h, rows, cols, margin, perp, dsec)
         self.calib.begin()
+        if dsec >= perp:
+            with self.shared.lock:
+                self.shared.status = "Warning: delay ≥ per-point"
+                self.shared.substatus = "이 포인트에서는 수집시간이 0초가 됩니다."
 
     def _stop_calibration(self, save=False):
         if self.calib and self.calib.collecting: self.calib.collecting=False
@@ -655,21 +689,22 @@ class GazeWorker(threading.Thread):
                 # 모드별 처리
                 if self.calib.collecting:
                     target_px = self.calib.current_target_px()
+                    ready = (time.time() - self.calib.start_t) >= float(self.calib.delay_sec)
                     finished=False
                     if gaze_feat is not None: finished = self.calib.feed(gaze_feat, t_now=time.time())
                     with self.shared.lock:
-                        self.shared.calibrating=True; self.shared.calib_target=target_px
+                        self.shared.calibrating=True; self.shared.calib_target=target_px; self.shared.calib_ready  = bool(ready)
                         self.shared.status=f"Calibration {self.calib.idx+1}/{self.calib.n_points()}"; self.shared.substatus="표시되는 원(고리)의 중심을 응시하세요"
                         self.shared.cross=None
                     if finished:
                         self.calib.save_model_pkl()
                         ds_path = self.calib.save_dataset_npz(DATA_DIR, {
                             "rows": self.calib.rows, "cols": self.calib.cols, "margin": float(self.calib.margin),
-                            "per_point_sec": float(self.calib.per_point_sec), "camera_index": int(self.args.camera),
+                            "per_point_sec": float(self.calib.per_point_sec), "delay_sec": float(self.calib.delay_sec), "camera_index": int(self.args.camera),
                             "mirror_preview": bool(self.args.mirror_preview)
                         })
                         with self.shared.lock:
-                            self.shared.calibrating=False; self.shared.calib_target=None
+                            self.shared.calibrating=False; self.shared.calib_target=None; self.shared.calib_ready  = False
                             self.shared.status="Calibrated & saved data"; self.shared.substatus=f"Saved: {os.path.basename(ds_path)}"
                 else:
                     px=None
@@ -710,6 +745,7 @@ def parse_args():
     p.add_argument("--rows", type=int, default=0); p.add_argument("--cols", type=int, default=0)
     p.add_argument("--margin", type=float, default=0.03, help="그리드 외곽 여백")
     p.add_argument("--per_point", type=float, default=2.0, help="점당 응시 시간(초)")
+    p.add_argument("--delay_time", type=float, default=0.5, help="포인트 이동 후 데이터 수집 지연(초)")
     p.add_argument("--camera", type=int, default=0, help="웹캠 인덱스")
     p.add_argument("--webcam_window", action="store_true", default=True)
     p.add_argument("--no-webcam_window", dest="webcam_window", action="store_false")
@@ -755,7 +791,7 @@ def main():
     if init_cols <= 0: init_cols = shared.calib_cols
     with shared.lock:
         shared.calib_rows = init_rows; shared.calib_cols = init_cols
-        shared.calib_per_point = float(args.per_point); shared.calib_margin = float(args.margin)
+        shared.calib_per_point = float(args.per_point); shared.calib_delay_sec = float(args.delay_time); shared.calib_margin = float(args.margin)
         shared.ema_alpha = float(args.ema_a)
         shared.oe_mincutoff=float(args.oe_mincutoff); shared.oe_beta=float(args.oe_beta); shared.oe_dcutoff=float(args.oe_dcutoff)
 
