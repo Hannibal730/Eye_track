@@ -454,6 +454,9 @@ class ControlPanel(QtWidgets.QWidget):
         gq.addWidget(b_quit)
         b_quit.clicked.connect(lambda: self.shared.set_cmd("quit"))
         self.show()
+        q_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("Q"), self)
+        q_shortcut.activated.connect(lambda: self.shared.set_cmd("stop_calib"))
+        
         
         # 바인딩
         self.cb_mesh.toggled       .connect(lambda v_: self._set("vis_mesh", v_))
@@ -730,6 +733,7 @@ class GazeWorker(threading.Thread):
                     elif k==ord('c'): self.shared.set_cmd("start_calib")
                     elif k==ord('s'): self.shared.set_cmd("stop_calib")
                     elif k==ord('o'): self.shared.set_cmd("toggle_overlay")
+                    elif k == ord('q'): self.shared.set_cmd("stop_calib")   # ★ 추가: q로 캘리브 종료
                 else:
                     time.sleep(0.001)
 
