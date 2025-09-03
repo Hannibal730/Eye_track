@@ -397,7 +397,8 @@ class OverlayWindow(QtWidgets.QWidget):
             p.fillRect(self.rect(), QtGui.QColor(0, 0, 0, 255))
 
         # 캘리브 타깃: 고리 → delay 후 채워진 원
-        if self.calib_target is not None:
+
+        if is_calib and self.calib_target is not None:
             tx, ty = self.calib_target
             if is_ready:
                 pen = QtGui.QPen(QtGui.QColor(255,165,0,255), 0)
@@ -636,6 +637,11 @@ class GazeWorker(threading.Thread):
             with build_facemesh(self.args) as face_mesh:
                 while not self.stop_flag.is_set():
                     with self.shared.lock:
+                        self.shared.calibrating = False
+                        self.shared.calib_target = None
+                        self.shared.calib_ready = False
+                        self.shared.status = "Calibrated & saved data"
+                        self.shared.substatus = f"Saved: {os.path.basename(ds_path)}"  # 네 코드의 변수명 유지
                         vis_mesh       = self.shared.vis_mesh
                         vis_iris       = self.shared.vis_iris
                         vis_iris_quad  = self.shared.vis_iris_quad
