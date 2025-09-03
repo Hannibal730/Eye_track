@@ -68,6 +68,7 @@ def _pca_axes_aniso(pts: np.ndarray):
         if a.size == 0: return 1e-6
         return float(np.sqrt(np.mean(a*a)) + 1e-6)
 
+    # 위/아래(û의 +/−), 좌/우(v̂의 +/−)
     su_pos = _rms(t1[t1 >= 0])
     su_neg = _rms(-t1[t1 < 0])
     sv_pos = _rms(t2[t2 >= 0])
@@ -876,12 +877,12 @@ def parse_args():
 
     # 패치 피처 옵션
     p.add_argument("--use_patches", action="store_true", default=True)
-    p.add_argument("--patch_w", type=int, default=40, help="패치 가로(px)")
-    p.add_argument("--patch_h", type=int, default=40, help="패치 세로(px)")
+    p.add_argument("--patch_w", type=int, default=50, help="패치 가로(px)")
+    p.add_argument("--patch_h", type=int, default=50, help="패치 세로(px)")
     p.add_argument("--patch_scale_w", type=float, default=2.5, help="half_w = max(s_u±)*scale")
     p.add_argument("--patch_scale_h", type=float, default=4.0, help="half_h = max(s_v±)*scale")
     p.add_argument("--patch_min_w_px", type=float, default=12.0, help="패치 half-width 최소 픽셀")
-    p.add_argument("--patch_min_h_px", type=float, default=12.0, help="패치 half-height 최소 픽셀")
+    p.add_argument("--patch_min_h_px", type=float, default=30.0, help="패치 half-height 최소 픽셀")
     p.add_argument("--patch_norm", type=str, default="z", choices=["z","none"])
     p.add_argument("--patch_clahe", action="store_true", default=True)
 
