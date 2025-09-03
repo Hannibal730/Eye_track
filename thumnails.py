@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-gaze_overlay_12d.py (+ Eye-Patch Fusion + Patch Visualization + Proper Quit & Thumbs Fix)
+gaze_overlay_12d.py
 - MediaPipe Face Mesh(iris 포함)로 12D 시선 피처 + (옵션)눈 패치 결합 → Ridge2D
-- 캘리브레이션: 지연수집(delay), 검정 배경, 고리→채워진 원 전환
+- 캘리브레이션: 지연수집(delay), 검정 배경(타깃 표시 중에만), 고리→채워진 원 전환
 - 시각화: 메쉬/홍채/축/컨투어/u-v/패치 ROI/패치 썸네일
 - UI: Start/Stop Calibration, Load, Hide/Show Overlay, Quit
-- 키: 'q' → **전체 종료**, 'c' 캘리브 시작, 's' 캘리브 정지, 'o' 오버레이 토글, ESC 전체 종료
-- 안정 종료: SIGINT/SIGTERM 처리, 카메라/윈도우 정리, FaceMesh 컨텍스트 안전 종료
+- 키: 'q' → 전체 종료, 'c' 시작, 's' 정지, 'o' 오버레이 토글, ESC 종료
 """
 import os, sys, time, argparse, re, threading, json, inspect, signal
 import numpy as np
@@ -16,7 +15,6 @@ import mediapipe as mp
 import pickle
 from datetime import datetime
 from PyQt5 import QtCore, QtGui, QtWidgets
-from collections import deque
 
 os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
@@ -32,8 +30,8 @@ mp_drawing         = mp.solutions.drawing_utils
 mp_drawing_styles  = mp.solutions.drawing_styles
 mp_face_mesh       = mp.solutions.face_mesh
 
-LEFT_IRIS_IDXS  = [474, 475, 476, 477]  # 좌안 4점
-RIGHT_IRIS_IDXS = [469, 470, 471, 472]  # 우안 4점
+LEFT_IRIS_IDXS  = [474, 475, 476, 477]
+RIGHT_IRIS_IDXS = [469, 470, 471, 472]
 
 def _unique_idxs(connections):
     s = set()
@@ -43,7 +41,6 @@ def _unique_idxs(connections):
 LEFT_EYE_ALL_IDXS  = _unique_idxs(mp_face_mesh.FACEMESH_LEFT_EYE)
 RIGHT_EYE_ALL_IDXS = _unique_idxs(mp_face_mesh.FACEMESH_RIGHT_EYE)
 
-# 12D 기하 피처 이름
 FEATURE_NAMES_12D = [
     "uL","vL","uR","vR",
     "uL2","vL2","uR2","vR2",
@@ -51,29 +48,65 @@ FEATURE_NAMES_12D = [
 ]
 
 # -------------------- 수학/피처 --------------------
-def _pca_axes(pts: np.ndarray):
+def _pca_axes_aniso(pts: np.ndarray):
+    """
+    PCA 축 계산 + 축 방향별(±) RMS 분리
+    반환:
+      c, ax1, ax2, (su_pos, su_neg), (sv_pos, sv_neg), su_vis, sv_vis
+    """
     c = pts.mean(axis=0)
     X = pts - c
+    # SVD로 주/부축
     U, S, Vt = np.linalg.svd(X, full_matrices=False)
-    ax1, ax2 = Vt[0], Vt[1]              # 단위벡터
-    su = 2 * (np.sqrt(np.mean((X @ ax1)**2)) + 1e-6) / 2.0  # RMS 기반 스케일
-    sv = 2 * (np.sqrt(np.mean((X @ ax2)**2)) + 1e-6) / 2.0
-    return c, ax1, ax2, su, sv
+    ax1, ax2 = Vt[0], Vt[1]   # 단위벡터
+
+    t1 = X @ ax1
+    t2 = X @ ax2
+
+    def _rms(a):
+        a = np.asarray(a, dtype=np.float32)
+        if a.size == 0: return 1e-6
+        return float(np.sqrt(np.mean(a*a)) + 1e-6)
+
+    su_pos = _rms(t1[t1 >= 0])
+    su_neg = _rms(-t1[t1 < 0])
+    sv_pos = _rms(t2[t2 >= 0])
+    sv_neg = _rms(-t2[t2 < 0])
+
+    # 시각화/기본 길이용(보수적으로 더 큰 쪽)
+    su_vis = max(su_pos, su_neg)
+    sv_vis = max(sv_pos, sv_neg)
+    return c, ax1, ax2, (su_pos, su_neg), (sv_pos, sv_neg), su_vis, sv_vis
 
 def _iris_center(landmarks, idxs, W, H):
     pts = np.array([(landmarks[i].x * W, landmarks[i].y * H) for i in idxs], dtype=np.float32)
     return pts.mean(axis=0)
 
 def _eye_uv_ex(landmarks, eye_idxs, iris_idxs, W, H):
+    """
+    비대칭 스케일 정규화:
+      u = du / (du>=0 ? su_pos : su_neg)
+      v = dv / (dv>=0 ? sv_pos : sv_neg)
+    또한 su_vis, sv_vis(큰 쪽)도 함께 반환(시각화·ROI 기본길이용)
+    """
     eye_pts = np.array([(landmarks[i].x * W, landmarks[i].y * H) for i in eye_idxs], dtype=np.float32)
-    c, ax1, ax2, su, sv = _pca_axes(eye_pts)
+    c, ax1, ax2, (su_p, su_n), (sv_p, sv_n), su_vis, sv_vis = _pca_axes_aniso(eye_pts)
     ic = _iris_center(landmarks, iris_idxs, W, H)
     delta = ic - c
-    du = float(np.dot(delta, ax1))   # Δ·û (px)
-    dv = float(np.dot(delta, ax2))   # Δ·v̂ (px)
-    u = float(du / su)
-    v = float(dv / sv)
-    return (u, v), ic, c, ax1, ax2, su, sv, du, dv, eye_pts
+    du = float(np.dot(delta, ax1))   # px
+    dv = float(np.dot(delta, ax2))   # px
+
+    su_used = (su_p if du >= 0 else su_n)
+    sv_used = (sv_p if dv >= 0 else sv_n)
+    # 혹시라도 0에 수렴 시 폭주 방지
+    su_used = max(su_used, 1e-6)
+    sv_used = max(sv_used, 1e-6)
+
+    u = float(du / su_used)
+    v = float(dv / sv_used)
+
+    aniso = (su_p, su_n, sv_p, sv_n)
+    return (u, v), ic, c, ax1, ax2, su_vis, sv_vis, du, dv, eye_pts, aniso
 
 def _feat_vector_12d(uL, vL, uR, vR):
     return np.array([
@@ -90,13 +123,8 @@ def _order_quad_clockwise(pts_xy: np.ndarray) -> np.ndarray:
 
 # -------------------- (PATCH) 눈 패치 유틸 --------------------
 def _warp_oriented_patch(bgr, center_xy, ax1, ax2, half_w, half_h, out_w, out_h):
-    """
-    눈의 PCA 축(ax1, ax2)에 정렬된 직사각형 ROI를 out_h x out_w로 워핑
-    """
     cx, cy = float(center_xy[0]), float(center_xy[1])
     ax1 = np.asarray(ax1, dtype=np.float32); ax2 = np.asarray(ax2, dtype=np.float32)
-
-    # 소스 평행사변형 3점 (좌상, 우상, 좌하) → 목적 사각형 3점
     src_tl = [cx - ax1[0]*half_w - ax2[0]*half_h, cy - ax1[1]*half_w - ax2[1]*half_h]
     src_tr = [cx + ax1[0]*half_w - ax2[0]*half_h, cy + ax1[1]*half_w - ax2[1]*half_h]
     src_bl = [cx - ax1[0]*half_w + ax2[0]*half_h, cy - ax1[1]*half_w + ax2[1]*half_h]
@@ -107,9 +135,6 @@ def _warp_oriented_patch(bgr, center_xy, ax1, ax2, half_w, half_h, out_w, out_h)
     return patch, np.array([src_tl, src_tr, src_bl], dtype=np.float32)
 
 def _patch_to_vec(gray_patch, do_clahe=True, norm="z"):
-    """
-    gray_patch: uint8 → (옵션)CLAHE → [0,1] → (옵션)z-score → 1D float32
-    """
     if do_clahe:
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4,4))
         gray_patch = clahe.apply(gray_patch)
@@ -123,12 +148,9 @@ def _patch_to_vec(gray_patch, do_clahe=True, norm="z"):
 def _build_feature_names(use_patches, pw, ph):
     if not use_patches: return list(FEATURE_NAMES_12D)
     n = pw*ph
-    L = [f"Lpx{i}" for i in range(n)]
-    R = [f"Rpx{i}" for i in range(n)]
-    return list(FEATURE_NAMES_12D) + L + R
+    return list(FEATURE_NAMES_12D) + [f"Lpx{i}" for i in range(n)] + [f"Rpx{i}" for i in range(n)]
 
 def _draw_oriented_box(img, tri3, color=(0,200,255), thickness=1):
-    """Affine에 사용한 3점을 받아 네번째 점을 복원해 사각형 폴리라인을 그림"""
     tl, tr, bl = tri3
     tl = np.asarray(tl); tr = np.asarray(tr); bl = np.asarray(bl)
     br = tr + (bl - tl)
@@ -144,8 +166,7 @@ def make_grid_points(rows:int, cols:int, margin:float=0.10, order:str="serpentin
     pts = []
     for r, y in enumerate(ys):
         row = [(x, y) for x in xs]
-        if order == "serpentine" and (r % 2 == 1):
-            row = row[::-1]
+        if order == "serpentine" and (r % 2 == 1): row = row[::-1]
         pts.extend(row)
     return pts
 
@@ -177,31 +198,26 @@ class Calibrator:
         self.reset()
         self.model = Ridge2D(alpha=10.0)
         self.feature_names = list(feature_names) if feature_names is not None else list(FEATURE_NAMES_12D)
-
     def reset(self):
         self.idx = 0; self.collecting = False
         self.samples_X, self.samples_Y = [], []
         self.samples_T, self.samples_IDX = [], []
         self.start_t = None
-
     def n_points(self): return len(self.points_norm)
     def current_target_px(self):
         nx, ny = self.points_norm[self.idx]
         return int(nx * self.sw), int(ny * self.sh)
-
     def begin(self):
         self.reset(); self.collecting = True; self.start_t = time.time()
-
     def feed(self, feat, t_now=None):
         if not self.collecting: return False
         tx, ty = self.current_target_px()
         tcur = float(time.time() if t_now is None else t_now)
-        if (tcur - self.start_t) >= self.delay_sec:   # delay 경과 시에만 기록
+        if (tcur - self.start_t) >= self.delay_sec:
             self.samples_X.append(np.array(feat, dtype=np.float32))
             self.samples_Y.append(np.array([tx, ty], dtype=np.float32))
             self.samples_IDX.append(int(self.idx))
             self.samples_T.append(tcur)
-
         if (tcur - self.start_t) >= self.per_point_sec:
             self.idx += 1
             self.start_t = time.time()
@@ -210,21 +226,17 @@ class Calibrator:
                 self.collecting = False
                 return True
         return False
-
     def has_model(self):  return (self.model.W is not None)
-
     def predict(self, feat):
         y = self.model.predict(np.array([feat], dtype=np.float32))[0]
         x = int(np.clip(y[0], 0, self.sw - 1))
         yv= int(np.clip(y[1], 0, self.sh - 1))
         return x, yv
-
     def save_model_pkl(self, path=None):
         if path is None: path = os.path.join(MODELS_DIR, "calib_gaze.pkl")
         with open(path, "wb") as f:
             pickle.dump({"W": self.model.W, "b": self.model.b, "screen": (self.sw, self.sh),
                          "feature_names": self.feature_names}, f)
-
     def save_dataset_npz(self, out_dir=DATA_DIR, meta_extra=None):
         os.makedirs(out_dir, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -242,7 +254,6 @@ class Calibrator:
                  screen=np.array([self.sw, self.sh], dtype=np.int32),
                  meta=json.dumps(meta))
         return path
-
     def load_linear_model(self, path):
         if path.lower().endswith(".npz"):
             d = np.load(path, allow_pickle=True)
@@ -296,8 +307,8 @@ class SharedState:
 
         # Calibration 설정(UI)
         self.calib_rows=8; self.calib_cols=12; self.calib_per_point=2.0; self.calib_margin=0.03
-        self.calib_delay_sec = 0.5   # 포인트 이동 후 수집 지연(초)
-        self.calib_ready = False     # delay 경과하여 수집 시작 가능한 상태
+        self.calib_delay_sec = 0.5
+        self.calib_ready = False
 
         # 시각화 옵션
         self.vis_mesh=False
@@ -310,9 +321,9 @@ class SharedState:
         self.uv_bigger_gain=25.0
         self.vis_eye_contour_pts   = False
         self.vis_eye_contour_edges = True
-        # 패치 시각화
-        self.vis_eye_patch_boxes   = False      # ROI 사각형
-        self.vis_patch_thumbs      = False      # 썸네일 인셋
+        # 패치 시각화 (기본 ON으로 변경)
+        self.vis_eye_patch_boxes   = True
+        self.vis_patch_thumbs      = True
 
         # 스무딩
         self.ema_alpha=0.8
@@ -322,7 +333,6 @@ class SharedState:
         self.cmd={"start_calib":False,"stop_calib":False,"load_model":False,
                   "toggle_overlay":False,"quit":False}
         self._load_path=None
-
     def set_cmd(self,name):
         with self.lock:
             if name in self.cmd: self.cmd[name]=True
@@ -379,8 +389,11 @@ class OverlayWindow(QtWidgets.QWidget):
         with self.shared.lock:
             is_calib = self.shared.calibrating
             is_ready = bool(getattr(self.shared, 'calib_ready', False))
-        if is_calib:
-            p.fillRect(self.rect(), QtGui.QColor(0, 0, 0, 255))  # 검정 배경
+            has_target = (self.shared.calib_target is not None)
+
+        # ★ 개선: 타깃 표시 중인 "실제 캘리브 단계"에서만 검정 배경
+        if is_calib and has_target:
+            p.fillRect(self.rect(), QtGui.QColor(0, 0, 0, 255))
 
         # 캘리브 타깃: 고리 → delay 후 채워진 원
         if self.calib_target is not None:
@@ -394,7 +407,6 @@ class OverlayWindow(QtWidgets.QWidget):
                 p.setPen(pen); p.setBrush(QtCore.Qt.NoBrush)
                 p.drawEllipse(QtCore.QPointF(tx, ty), 16, 16)
 
-        # 추정점: 빨간 고리
         with self.shared.lock: cross=self.shared.cross
         if cross is not None:
             x,y=cross; pen=QtGui.QPen(QtGui.QColor(255,0,0,230), 4)
@@ -411,26 +423,21 @@ class ControlPanel(QtWidgets.QWidget):
 
         v = QtWidgets.QVBoxLayout(self)
 
-        # Calibration grid
         grpC = QtWidgets.QGroupBox("Calibration Grid"); v.addWidget(grpC)
         gc = QtWidgets.QGridLayout(grpC)
         self.sb_rows = QtWidgets.QSpinBox(); self.sb_rows.setRange(1,100); self.sb_rows.setValue(self.shared.calib_rows)
         self.sb_cols = QtWidgets.QSpinBox(); self.sb_cols.setRange(1,100); self.sb_cols.setValue(self.shared.calib_cols)
         gc.addWidget(QtWidgets.QLabel("Rows"),0,0); gc.addWidget(self.sb_rows,0,1)
         gc.addWidget(QtWidgets.QLabel("Columns"),1,0); gc.addWidget(self.sb_cols,1,1)
-        # calib sec
         self.sb_per  = QtWidgets.QDoubleSpinBox(); self.sb_per.setRange(0.1,10.0); self.sb_per.setSingleStep(0.1); self.sb_per.setDecimals(2); self.sb_per.setValue(self.shared.calib_per_point)
-        self.sb_delay = QtWidgets.QDoubleSpinBox()
-        self.sb_delay.setRange(0.0, 10.0); self.sb_delay.setDecimals(2); self.sb_delay.setValue(self.shared.calib_delay_sec)
+        self.sb_delay = QtWidgets.QDoubleSpinBox(); self.sb_delay.setRange(0.0, 10.0); self.sb_delay.setDecimals(2); self.sb_delay.setValue(self.shared.calib_delay_sec)
         gc.addWidget(QtWidgets.QLabel("Per-point (sec)"),2,0); gc.addWidget(self.sb_per,2,1)
         gc.addWidget(QtWidgets.QLabel("Delay (sec)"), 3, 0); gc.addWidget(self.sb_delay, 3, 1)
-        # 바인딩
         self.sb_rows.valueChanged.connect(lambda v_: self._set("calib_rows", int(v_)))
         self.sb_cols.valueChanged.connect(lambda v_: self._set("calib_cols", int(v_)))
         self.sb_per .valueChanged.connect(lambda v_: self._set("calib_per_point", float(v_)))
         self.sb_delay.valueChanged.connect(lambda v_: self._set("calib_delay_sec", float(v_)))
 
-        # === Calibration Command ===
         grpCmd = QtWidgets.QGroupBox("Calibration Command")
         glcmd  = QtWidgets.QGridLayout(grpCmd)
         b_calib = QtWidgets.QPushButton("Start Calibration")
@@ -445,26 +452,24 @@ class ControlPanel(QtWidgets.QWidget):
         b_stop .clicked.connect(lambda: self.shared.set_cmd("stop_calib"))
         b_load .clicked.connect(self._choose_and_load_model)
         b_ov   .clicked.connect(lambda: self.shared.set_cmd("toggle_overlay"))
-        # Quit: shared 명령 + Qt 종료 요청
         b_quit .clicked.connect(lambda: (self.shared.set_cmd("quit"),
                                          QtCore.QTimer.singleShot(0, QtWidgets.QApplication.instance().quit)))
         v.addWidget(grpCmd)
 
-        # Visualization
         grp = QtWidgets.QGroupBox("Visualization"); v.addWidget(grp)
         gl = QtWidgets.QGridLayout(grp)
-        self.cb_mesh        = QtWidgets.QCheckBox("Face Mesh");            self.cb_mesh.setChecked(False)
-        self.cb_iris        = QtWidgets.QCheckBox("Iris centers");         self.cb_iris.setChecked(True)
-        self.cb_iris_quad   = QtWidgets.QCheckBox("Iris 4-edges");         self.cb_iris_quad.setChecked(True)
-        self.cb_axes        = QtWidgets.QCheckBox('Eye axes (fixed length; u_hat, v_hat)');   self.cb_axes.setChecked(True)
-        self.cb_axes_s      = QtWidgets.QCheckBox('Eye axes (eye scaled length; s_u, s_v)');  self.cb_axes_s.setChecked(False)
-        self.cb_uvvec       = QtWidgets.QCheckBox("u, v vectors");         self.cb_uvvec.setChecked(False)
-        self.cb_uvvec_big   = QtWidgets.QCheckBox("u, v vectors (bigger)");self.cb_uvvec_big.setChecked(True)
-        self.sb_uv_gain     = QtWidgets.QDoubleSpinBox(); self.sb_uv_gain.setRange(0.1,100.0); self.sb_uv_gain.setSingleStep(0.1); self.sb_uv_gain.setDecimals(1); self.sb_uv_gain.setValue(25.0)
-        self.cb_cnt_pts     = QtWidgets.QCheckBox("Eye contour points");   self.cb_cnt_pts.setChecked(False)
-        self.cb_cnt_edges   = QtWidgets.QCheckBox("Eye contour edges");    self.cb_cnt_edges.setChecked(True)
-        self.cb_patch_boxes = QtWidgets.QCheckBox("Eye patch ROI boxes");  self.cb_patch_boxes.setChecked(False)
-        self.cb_patch_th    = QtWidgets.QCheckBox("Eye patch thumbnails"); self.cb_patch_th.setChecked(False)
+        self.cb_mesh        = QtWidgets.QCheckBox("Face Mesh");            self.cb_mesh.setChecked(self.shared.vis_mesh)
+        self.cb_iris        = QtWidgets.QCheckBox("Iris centers");         self.cb_iris.setChecked(self.shared.vis_iris)
+        self.cb_iris_quad   = QtWidgets.QCheckBox("Iris 4-edges");         self.cb_iris_quad.setChecked(self.shared.vis_iris_quad)
+        self.cb_axes        = QtWidgets.QCheckBox('Eye axes (fixed length; u_hat, v_hat)');   self.cb_axes.setChecked(self.shared.vis_eye_axes)
+        self.cb_axes_s      = QtWidgets.QCheckBox('Eye axes (eye scaled length; s_u, s_v)');  self.cb_axes_s.setChecked(self.shared.vis_eye_axes_scaled)
+        self.cb_uvvec       = QtWidgets.QCheckBox("u, v vectors");         self.cb_uvvec.setChecked(self.shared.vis_uv_vectors)
+        self.cb_uvvec_big   = QtWidgets.QCheckBox("u, v vectors (bigger)");self.cb_uvvec_big.setChecked(self.shared.vis_uv_vectors_bigger)
+        self.sb_uv_gain     = QtWidgets.QDoubleSpinBox(); self.sb_uv_gain.setRange(0.1,100.0); self.sb_uv_gain.setSingleStep(0.1); self.sb_uv_gain.setDecimals(1); self.sb_uv_gain.setValue(self.shared.uv_bigger_gain)
+        self.cb_cnt_pts     = QtWidgets.QCheckBox("Eye contour points");   self.cb_cnt_pts.setChecked(self.shared.vis_eye_contour_pts)
+        self.cb_cnt_edges   = QtWidgets.QCheckBox("Eye contour edges");    self.cb_cnt_edges.setChecked(self.shared.vis_eye_contour_edges)
+        self.cb_patch_boxes = QtWidgets.QCheckBox("Eye patch ROI boxes");  self.cb_patch_boxes.setChecked(self.shared.vis_eye_patch_boxes)
+        self.cb_patch_th    = QtWidgets.QCheckBox("Eye patch thumbnails"); self.cb_patch_th.setChecked(self.shared.vis_patch_thumbs)
 
         gl.addWidget(self.cb_mesh,       0,0)
         gl.addWidget(self.cb_iris,       1,0); gl.addWidget(self.cb_iris_quad,  1,1)
@@ -474,7 +479,6 @@ class ControlPanel(QtWidgets.QWidget):
         gl.addWidget(self.cb_cnt_pts,    5,0); gl.addWidget(self.cb_cnt_edges,  5,1)
         gl.addWidget(self.cb_patch_boxes,6,0); gl.addWidget(self.cb_patch_th,   6,1)
 
-        # Smoothing
         grp2 = QtWidgets.QGroupBox("Smoothing Factors"); v.addWidget(grp2)
         g2 = QtWidgets.QGridLayout(grp2)
         g2.addWidget(QtWidgets.QLabel("OneEuro mincutoff"), 0,0)
@@ -491,7 +495,6 @@ class ControlPanel(QtWidgets.QWidget):
         g2.addWidget(self.sb_ema,3,1)
 
         self.show()
-        # 단축키 Q: **전체 종료**
         q_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("Q"), self)
         q_shortcut.activated.connect(lambda: (self.shared.set_cmd("quit"),
                                               QtCore.QTimer.singleShot(0, QtWidgets.QApplication.instance().quit)))
@@ -548,6 +551,8 @@ class GazeWorker(threading.Thread):
         self.patch_w = int(args.patch_w); self.patch_h = int(args.patch_h)
         self.patch_scale_w = float(args.patch_scale_w)
         self.patch_scale_h = float(args.patch_scale_h)
+        self.patch_min_w_px = float(args.patch_min_w_px)
+        self.patch_min_h_px = float(args.patch_min_h_px)
         self.patch_norm = "z" if args.patch_norm == "z" else None
         self.patch_clahe = bool(args.patch_clahe)
 
@@ -572,7 +577,7 @@ class GazeWorker(threading.Thread):
     def _stop_calibration(self, save=False):
         if self.calib and self.calib.collecting: self.calib.collecting=False
         with self.shared.lock:
-            self.shared.calibrating=False; self.shared.calib_target=None
+            self.shared.calibrating=False; self.shared.calib_target=None; self.shared.calib_ready=False
             self.shared.substatus = "Calibration stopped" if not save else "Calibration saved"
 
     @staticmethod
@@ -583,23 +588,27 @@ class GazeWorker(threading.Thread):
             cv2.line(img, pa, pb, color, thickness, cv2.LINE_AA)
 
     def _build_fused_feature(self, frame_bgr, uL, vL, uR, vR,
-                             cL, ax1L, ax2L, suL, svL,
-                             cR, ax1R, ax2R, suR, svR):
+                             cL, ax1L, ax2L, anisoL, su_visL, sv_visL,
+                             cR, ax1R, ax2R, anisoR, su_visR, sv_visR):
+        """
+        anisoX: (su_pos, su_neg, sv_pos, sv_neg)
+        ROI half-size는 max(side) 기반 + 최소 픽셀 바닥값 적용
+        """
         f12 = _feat_vector_12d(uL, vL, uR, vR)
         if not self.use_patches:
-            return f12, None, None, None, None  # (feat, pL, triL, pR, triR)
+            return f12, None, None, None, None
 
-        # half sizes in pixels (RMS scale 기반 스케일 × 게인)
-        half_w_L = suL * self.patch_scale_w
-        half_h_L = svL * self.patch_scale_h
-        half_w_R = suR * self.patch_scale_w
-        half_h_R = svR * self.patch_scale_h
+        su_pL, su_nL, sv_pL, sv_nL = anisoL
+        su_pR, su_nR, sv_pR, sv_nR = anisoR
 
-        # 좌/우 패치 추출 (PCA 축 정렬 워핑)
+        half_w_L = max(self.patch_min_w_px, max(su_pL, su_nL) * self.patch_scale_w)
+        half_h_L = max(self.patch_min_h_px, max(sv_pL, sv_nL) * self.patch_scale_h)
+        half_w_R = max(self.patch_min_w_px, max(su_pR, su_nR) * self.patch_scale_w)
+        half_h_R = max(self.patch_min_h_px, max(sv_pR, sv_nR) * self.patch_scale_h)
+
         pL, triL = _warp_oriented_patch(frame_bgr, cL, ax1L, ax2L, half_w_L, half_h_L, self.patch_w, self.patch_h)
         pR, triR = _warp_oriented_patch(frame_bgr, cR, ax1R, ax2R, half_w_R, half_h_R, self.patch_w, self.patch_h)
 
-        # 그레이스케일 + (선택)CLAHE + 정규화 → 1D 벡터
         gL = cv2.cvtColor(pL, cv2.COLOR_BGR2GRAY)
         gR = cv2.cvtColor(pR, cv2.COLOR_BGR2GRAY)
         vL = _patch_to_vec(gL, do_clahe=self.patch_clahe, norm=self.patch_norm)
@@ -610,11 +619,9 @@ class GazeWorker(threading.Thread):
     def run(self):
         cap = None
         try:
-            # --- 카메라 오픈 ---
             cap = cv2.VideoCapture(self.args.camera)
             if not cap.isOpened():
                 print("Could not open webcam."); return
-            # 입력 품질(가능하면 MJPG 고정, 버퍼 최소화로 지연 방지)
             try:
                 fourcc = cv2.VideoWriter_fourcc(*self.args.cam_fourcc)
                 cap.set(cv2.CAP_PROP_FOURCC, fourcc)
@@ -625,15 +632,6 @@ class GazeWorker(threading.Thread):
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.args.cam_h)
             cap.set(cv2.CAP_PROP_FPS,          self.args.cam_fps)
 
-            # 실제 협상된 값 로깅
-            real_w  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            real_h  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            real_fps= cap.get(cv2.CAP_PROP_FPS)
-            fourcc_v = int(cap.get(cv2.CAP_PROP_FOURCC))
-            fc_str = "".join([chr((fourcc_v >> 8*i) & 0xFF) for i in range(4)])
-            print(f"[CAM] {real_w}x{real_h} @ {real_fps:.1f} FPS, FourCC={fc_str}")
-
-            # FaceMesh
             with build_facemesh(self.args) as face_mesh:
                 while not self.stop_flag.is_set():
                     with self.shared.lock:
@@ -650,7 +648,7 @@ class GazeWorker(threading.Thread):
                         vis_patch_boxes= self.shared.vis_eye_patch_boxes
                         vis_patch_th   = self.shared.vis_patch_thumbs
                         ema_a          = float(self.shared.ema_alpha)
-                        # OneEuro 최신 파라미터 적용
+                        # OneEuro 최신 파라미터
                         self.oe.mincutoff=float(self.args.oe_mincutoff)
                         self.oe.beta     =float(self.args.oe_beta)
                         self.oe.dcutoff  =float(self.args.oe_dcutoff)
@@ -666,15 +664,17 @@ class GazeWorker(threading.Thread):
 
                     if res.multi_face_landmarks:
                         lms = res.multi_face_landmarks[0].landmark
-                        (uL, vL), icL, cL, ax1L, ax2L, suL, svL, _, _, l_eye_pts = _eye_uv_ex(lms, LEFT_EYE_ALL_IDXS,  LEFT_IRIS_IDXS,  W, H)
-                        (uR, vR), icR, cR, ax1R, ax2R, suR, svR, _, _, r_eye_pts = _eye_uv_ex(lms, RIGHT_EYE_ALL_IDXS, RIGHT_IRIS_IDXS, W, H)
+                        (uL, vL), icL, cL, ax1L, ax2L, suL_vis, svL_vis, duL, dvL, l_eye_pts, anisoL = _eye_uv_ex(
+                            lms, LEFT_EYE_ALL_IDXS,  LEFT_IRIS_IDXS,  W, H)
+                        (uR, vR), icR, cR, ax1R, ax2R, suR_vis, svR_vis, duR, dvR, r_eye_pts, anisoR = _eye_uv_ex(
+                            lms, RIGHT_EYE_ALL_IDXS, RIGHT_IRIS_IDXS, W, H)
 
-                        # 패치 + 12D 결합 피처
-                        gaze_feat, pL, triL, pR, triR = self._build_fused_feature(out, uL, vL, uR, vR,
-                                                                                  cL, ax1L, ax2L, suL, svL,
-                                                                                  cR, ax1R, ax2R, suR, svR)
+                        gaze_feat, pL, triL, pR, triR = self._build_fused_feature(
+                            out, uL, vL, uR, vR,
+                            cL, ax1L, ax2L, anisoL, suL_vis, svL_vis,
+                            cR, ax1R, ax2R, anisoR, suR_vis, svR_vis
+                        )
 
-                        # 시각화
                         if vis_mesh:
                             mp_drawing.draw_landmarks(out, res.multi_face_landmarks[0],
                                 mp_face_mesh.FACEMESH_TESSELATION, None,
@@ -685,14 +685,13 @@ class GazeWorker(threading.Thread):
                             mp_drawing.draw_landmarks(out, res.multi_face_landmarks[0],
                                 mp_face_mesh.FACEMESH_IRISES, None,
                                 mp_drawing_styles.get_default_face_mesh_iris_connections_style())
+
                         if vis_cnt_pts:
                             for pt in l_eye_pts:
                                 cv2.circle(out, (int(pt[0]), int(pt[1])), 2, (0, 255, 0), -1, cv2.LINE_AA)
                             for pt in r_eye_pts:
-                                cv2.circle(out, (int(pt[0]), int(pt[1])), 2, (0, 0, 255), -1, cv2.LINE_AA)    
-                        
-                        # BGR
-                            
+                                cv2.circle(out, (int(pt[0]), int(pt[1])), 2, (0, 0, 255), -1, cv2.LINE_AA)
+
                         if self.shared.vis_iris:
                             cv2.circle(out,(int(icL[0]),int(icL[1])),3,(255,255,0),-1)
                             cv2.circle(out,(int(icR[0]),int(icR[1])),3,(255,255,0),-1)
@@ -702,44 +701,46 @@ class GazeWorker(threading.Thread):
                             for pts, color in [(ptsL, (255,255,0)), (ptsR, (255,255,0))]:
                                 ordered = _order_quad_clockwise(pts)
                                 poly    = ordered.astype(np.int32).reshape(-1,1,2)
-                                cv2.polylines(out, [poly], isClosed=True, color=color, thickness=1, lineType=cv2.LINE_AA)
+                                cv2.polylines(out, [poly], True, color, 1, cv2.LINE_AA)
+
                         if vis_axes:
-                            # 고정 길이 축
                             for (c,a1,a2,col) in [(cL,ax1L,ax2L,(0,225,0)), (cR,ax1R,ax2R,(0,0,255))]:
                                 L=25
                                 cv2.line(out,(int(c[0]-a1[0]*L),int(c[1]-a1[1]*L)),(int(c[0]+a1[0]*L),int(c[1]+a1[1]*L)),col,1,cv2.LINE_AA)
                                 cv2.line(out,(int(c[0]-a2[0]*L),int(c[1]-a2[1]*L)),(int(c[0]+a2[0]*L),int(c[1]+a2[1]*L)),col,1,cv2.LINE_AA)
                         if vis_axes_s:
-                            for c,a1,a2,su,sv in [(cL,ax1L,ax2L,suL,svL),(cR,ax1R,ax2R,suR,svR)]:
-                                cv2.line(out,(int(c[0]-a1[0]*su),int(c[1]-a1[1]*su)),(int(c[0]+a1[0]*su),int(c[1]+a1[1]*su)),(255,0,255),1,cv2.LINE_AA)
-                                cv2.line(out,(int(c[0]-a2[0]*sv),int(c[1]-a2[1]*sv)),(int(c[0]+a2[0]*sv),int(c[1]+a2[1]*sv)),(0,255,255),1,cv2.LINE_AA)
+                            # 스케일 축은 보수적 길이(s_vis) 사용
+                            for c,a1,a2,su_v,sv_v in [(cL,ax1L,ax2L,suL_vis,svL_vis),(cR,ax1R,ax2R,suR_vis,svR_vis)]:
+                                cv2.line(out,(int(c[0]-a1[0]*su_v),int(c[1]-a1[1]*su_v)),(int(c[0]+a1[0]*su_v),int(c[1]+a1[1]*su_v)),(255,0,255),1,cv2.LINE_AA)
+                                cv2.line(out,(int(c[0]-a2[0]*sv_v),int(c[1]-a2[1]*sv_v)),(int(c[0]+a2[0]*sv_v),int(c[1]+a2[1]*sv_v)),(0,255,255),1,cv2.LINE_AA)
+
                         if self.shared.vis_uv_vectors or self.shared.vis_uv_vectors_bigger:
-                            for (c,a1,a2,su,sv,u,v) in [(cL,ax1L,ax2L,suL,svL,uL,vL),(cR,ax1R,ax2R,suR,svR,uR,vR)]:
+                            for (c,a1,a2,su_v,sv_v,u,v) in [(cL,ax1L,ax2L,suL_vis,svL_vis,uL,vL),(cR,ax1R,ax2R,suR_vis,svR_vis,uR,vR)]:
                                 base=(int(c[0]),int(c[1]))
                                 if self.shared.vis_uv_vectors:
-                                    vec_u = a1*(u*su); vec_v = a2*(v*sv)
+                                    vec_u = a1*(u*su_v); vec_v = a2*(v*sv_v)
                                     cv2.arrowedLine(out, base, (base[0]+int(vec_u[0]), base[1]+int(vec_u[1])), (255,0,255),2,tipLength=0.3)
                                     cv2.arrowedLine(out, base, (base[0]+int(vec_v[0]), base[1]+int(vec_v[1])), (0,255,255),2,tipLength=0.3)
                                 if self.shared.vis_uv_vectors_bigger and uv_gain>0.0:
-                                    big_u=a1*(u*su*uv_gain); big_v=a2*(v*sv*uv_gain)
+                                    big_u=a1*(u*su_v*uv_gain); big_v=a2*(v*sv_v*uv_gain)
                                     cv2.arrowedLine(out, base, (base[0]+int(big_u[0]), base[1]+int(big_u[1])), (255,0,255),3,tipLength=0.25)
                                     cv2.arrowedLine(out, base, (base[0]+int(big_v[0]), base[1]+int(big_v[1])), (0,255,255),3,tipLength=0.25)
+
                         if vis_cnt_edges:
                             self._draw_edges(out, mp_face_mesh.FACEMESH_LEFT_EYE,  lms, W, H, color=(0,255,0), thickness=1)
                             self._draw_edges(out, mp_face_mesh.FACEMESH_RIGHT_EYE, lms, W, H, color=(0,0,255), thickness=1)
-                        if self.shared.vis_eye_patch_boxes and triL is not None and triR is not None:
+                        if vis_patch_boxes and (triL is not None) and (triR is not None):
                             _draw_oriented_box(out, triL, color=(0,255,0), thickness=2)
                             _draw_oriented_box(out, triR, color=(0,0,255), thickness=2)
 
                     # 명령 처리
                     if self.shared.pop_cmd("quit"):
-                        # Qt 메인루프도 종료 요청
                         app = QtWidgets.QApplication.instance()
                         if app: QtCore.QMetaObject.invokeMethod(app, "quit", QtCore.Qt.QueuedConnection)
                         self.stop_flag.set()
                         break
                     if self.shared.pop_cmd("start_calib"): self._start_new_calibration()
-                    if self.shared.pop_cmd("stop_calib"):  self._stop_calibration(save=False)
+                    if self.shared.pop_cmd("stop_calib"):  self._stop_calibration(False)
                     if self.shared.pop_cmd("load_model"):
                         path=self.shared.pop_load_path()
                         if path:
@@ -760,8 +761,11 @@ class GazeWorker(threading.Thread):
                         finished=False
                         if gaze_feat is not None: finished = self.calib.feed(gaze_feat, t_now=time.time())
                         with self.shared.lock:
-                            self.shared.calibrating=True; self.shared.calib_target=target_px; self.shared.calib_ready  = bool(ready)
-                            self.shared.status=f"Calibration {self.calib.idx+1}/{self.calib.n_points()}"; self.shared.substatus="표시되는 원(고리)의 중심을 응시하세요"
+                            self.shared.calibrating=True
+                            self.shared.calib_target=target_px
+                            self.shared.calib_ready  = bool(ready)
+                            self.shared.status=f"Calibration {self.calib.idx+1}/{self.calib.n_points()}"
+                            self.shared.substatus="표시되는 원(고리)의 중심을 응시하세요"
                             self.shared.cross=None
                         if finished:
                             self.calib.save_model_pkl()
@@ -772,11 +776,16 @@ class GazeWorker(threading.Thread):
                                 "mirror_preview": bool(self.args.mirror_preview),
                                 "use_patches": bool(self.use_patches), "patch_w": int(self.patch_w), "patch_h": int(self.patch_h),
                                 "patch_scale_w": float(self.patch_scale_w), "patch_scale_h": float(self.patch_scale_h),
+                                "patch_min_w_px": float(self.patch_min_w_px), "patch_min_h_px": float(self.patch_min_h_px),
                                 "patch_norm": self.patch_norm or "none", "patch_clahe": bool(self.patch_clahe)
                             })
+                            # ★ 끝난 즉시 검정 배경 해제되도록 상태 리셋
                             with self.shared.lock:
-                                self.shared.calibrating=False; self.shared.calib_target=None; self.shared.calib_ready  = False
-                                self.shared.status="Calibrated & saved data"; self.shared.substatus=f"Saved: {os.path.basename(ds_path)}"
+                                self.shared.calibrating=False
+                                self.shared.calib_target=None
+                                self.shared.calib_ready  = False
+                                self.shared.status="Calibrated & saved data"
+                                self.shared.substatus=f"Saved: {os.path.basename(ds_path)}"
                     else:
                         px=None
                         if (gaze_feat is not None) and self.calib.has_model():
@@ -788,46 +797,39 @@ class GazeWorker(threading.Thread):
                                 self.ema_last = a*self.ema_last + (1.0-a)*oe
                             sm=self.ema_last; px=(int(sm[0]),int(sm[1]))
                         with self.shared.lock:
-                            self.shared.calibrating=False; self.shared.calib_target=None
-                            self.shared.cross=px; self.shared.status="Gaze Overlay"; self.shared.substatus="Use Control Panel"
+                            self.shared.calibrating=False
+                            self.shared.calib_target=None
+                            self.shared.calib_ready=False
+                            self.shared.cross=px
+                            self.shared.status="Gaze Overlay"
+                            self.shared.substatus="Use Control Panel"
 
                     # 프리뷰 창
                     if self.args.webcam_window:
                         disp = out
-                        if self.args.mirror_preview:
-                            disp = cv2.flip(out,1)
-                        # === 썸네일은 'disp'에 그림: 좌=왼눈, 우=오른눈 (반전 없음) ===
+                        if self.args.mirror_preview: disp = cv2.flip(out,1)
                         if self.use_patches and self.shared.vis_patch_thumbs and (pL is not None) and (pR is not None):
                             th_h = 5*self.patch_h
                             th_w = 5*self.patch_w
-                            # 왼눈
                             thL = cv2.resize(pL, (th_w, th_h), interpolation=cv2.INTER_NEAREST) 
-                            # 오른눈 (표시용: 오른눈 썸네일 좌우반전 보정)
                             thR = cv2.resize(pR, (th_w, th_h), interpolation=cv2.INTER_NEAREST)
-                            thR = cv2.flip(thR, 1)   # <-- 추가 (썸네일 표시만 보정; 학습 피처에는 영향 없음)
+                            thR = cv2.flip(thR, 1)  # 표시용 보정(학습 입력에는 영향 없음)
                             pad = 8
                             y0 = disp.shape[0] - th_h - pad
                             x0 = pad
-                            # 왼쪽에 왼눈
                             disp[y0:y0+th_h, x0:x0+th_w] = thL
                             cv2.rectangle(disp, (x0-1,y0-1), (x0+th_w, y0+th_h), (0,255,255), 1, cv2.LINE_AA)
-                            # 오른쪽에 오른눈
                             x1 = x0 + th_w + pad
                             disp[y0:y0+th_h, x1:x1+th_w] = thR
                             cv2.rectangle(disp, (x1-1,y0-1), (x1+th_w, y0+th_h), (0,255,255), 1, cv2.LINE_AA)
 
                         cv2.imshow('MediaPipe Face Mesh', disp)
                         k=cv2.waitKey(1)&0xFF
-                        if k==27:   # ESC
-                            self.shared.set_cmd("quit")
-                        elif k==ord('c'):
-                            self.shared.set_cmd("start_calib")
-                        elif k==ord('s'):
-                            self.shared.set_cmd("stop_calib")
-                        elif k==ord('o'):
-                            self.shared.set_cmd("toggle_overlay")
-                        elif k==ord('q'):
-                            self.shared.set_cmd("quit")  # q → 전체 종료
+                        if k==27:   self.shared.set_cmd("quit")
+                        elif k==ord('c'): self.shared.set_cmd("start_calib")
+                        elif k==ord('s'): self.shared.set_cmd("stop_calib")
+                        elif k==ord('o'): self.shared.set_cmd("toggle_overlay")
+                        elif k==ord('q'): self.shared.set_cmd("quit")
                     else:
                         time.sleep(0.001)
         finally:
@@ -845,7 +847,6 @@ class GazeWorker(threading.Thread):
 # -------------------- 인자 --------------------
 def parse_args():
     p = argparse.ArgumentParser(description="MediaPipe FaceMesh + PyQt gaze overlay (12D + optional eye patches)")
-    # 기본 설정
     p.add_argument("--grid", type=str, default="", help="예: '4,8' 또는 '4x8'")
     p.add_argument("--rows", type=int, default=0); p.add_argument("--cols", type=int, default=0)
     p.add_argument("--margin", type=float, default=0.03, help="그리드 외곽 여백")
@@ -863,32 +864,31 @@ def parse_args():
     p.add_argument("--oe_dcutoff", type=float, default=1.0)
 
     # MediaPipe
-    p.add_argument("--mp_min_det", type=float, default=0.75, help="min_detection_confidence (0~1)")
-    p.add_argument("--mp_min_track", type=float, default=0.75, help="min_tracking_confidence (0~1)")
-    p.add_argument("--mp_refine_landmarks", action="store_true", default=True,
-                   help="홍채/입술 정밀 랜드마크 사용(정확도↑, 연산↑)")
+    p.add_argument("--mp_min_det", type=float, default=0.75)
+    p.add_argument("--mp_min_track", type=float, default=0.75)
+    p.add_argument("--mp_refine_landmarks", action="store_true", default=True)
 
     # 카메라 입력 품질
-    p.add_argument("--cam_w",   type=int, default=1920, help="캡처 가로 해상도")
-    p.add_argument("--cam_h",   type=int, default=1080, help="캡처 세로 해상도")
-    p.add_argument("--cam_fps", type=int, default=30, help="캡처 FPS")
-    p.add_argument("--cam_fourcc", type=str, default="MJPG", help="코덱 FourCC (예: MJPG, YUYV)")
+    p.add_argument("--cam_w",   type=int, default=1920)
+    p.add_argument("--cam_h",   type=int, default=1080)
+    p.add_argument("--cam_fps", type=int, default=30)
+    p.add_argument("--cam_fourcc", type=str, default="MJPG")
 
     # 패치 피처 옵션
-    p.add_argument("--use_patches", action="store_true", default=True,
-                   help="좌/우 눈 패치 벡터를 12D에 결합")
+    p.add_argument("--use_patches", action="store_true", default=True)
     p.add_argument("--patch_w", type=int, default=40, help="패치 가로(px)")
     p.add_argument("--patch_h", type=int, default=40, help="패치 세로(px)")
-    p.add_argument("--patch_scale_w", type=float, default=2.5, help="패치 반폭 = su * scale")
-    p.add_argument("--patch_scale_h", type=float, default=4.0, help="패치 반높이 = sv * scale")
-    p.add_argument("--patch_norm", type=str, default="z", choices=["z","none"], help="패치 벡터 정규화")
-    p.add_argument("--patch_clahe", action="store_true", default=True, help="CLAHE 적용")
+    p.add_argument("--patch_scale_w", type=float, default=2.5, help="half_w = max(s_u±)*scale")
+    p.add_argument("--patch_scale_h", type=float, default=4.0, help="half_h = max(s_v±)*scale")
+    p.add_argument("--patch_min_w_px", type=float, default=12.0, help="패치 half-width 최소 픽셀")
+    p.add_argument("--patch_min_h_px", type=float, default=12.0, help="패치 half-height 최소 픽셀")
+    p.add_argument("--patch_norm", type=str, default="z", choices=["z","none"])
+    p.add_argument("--patch_clahe", action="store_true", default=True)
 
     return p.parse_args()
 
 # -------------------- 메인 --------------------
 def install_signal_handlers(shared: SharedState, app: QtWidgets.QApplication):
-    # Ctrl+C 등으로 들어오면 깔끔히 종료
     def _sig_handler(signum, frame):
         shared.set_cmd("quit")
         QtCore.QTimer.singleShot(0, app.quit)
@@ -904,7 +904,6 @@ def main():
     panel = ControlPanel(shared)
     args = parse_args()
 
-    # 초기 grid 해석
     init_rows, init_cols = 0, 0
     if args.grid:
         m = re.match(r'^\s*(\d+)\s*[,xX]\s*(\d+)\s*$', args.grid)
@@ -919,7 +918,6 @@ def main():
         shared.ema_alpha = float(args.ema_a)
         shared.oe_mincutoff=float(args.oe_mincutoff); shared.oe_beta=float(args.oe_beta); shared.oe_dcutoff=float(args.oe_dcutoff)
 
-    # 시그널 핸들러 설치(안정 종료)
     install_signal_handlers(shared, app)
 
     worker = GazeWorker(shared, args); worker.start()
