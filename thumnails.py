@@ -307,7 +307,7 @@ class SharedState:
         self.status="Gaze Overlay"; self.substatus="Use Control Panel"
 
         # Calibration 설정(UI)
-        self.calib_rows=8; self.calib_cols=12; self.calib_per_point=2.0; self.calib_margin=0.03
+        self.calib_rows=0; self.calib_cols=0; self.calib_per_point=2.0; self.calib_margin=0.03
         self.calib_delay_sec = 0.5
         self.calib_ready = False
 
@@ -420,7 +420,7 @@ class ControlPanel(QtWidgets.QWidget):
         self.shared=shared
         self.setWindowTitle("Control Panel")
         self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
-        self.setFixedWidth(680)
+        self.setFixedWidth(600)
 
         v = QtWidgets.QVBoxLayout(self)
 
@@ -848,7 +848,7 @@ class GazeWorker(threading.Thread):
 # -------------------- 인자 --------------------
 def parse_args():
     p = argparse.ArgumentParser(description="MediaPipe FaceMesh + PyQt gaze overlay (12D + optional eye patches)")
-    p.add_argument("--grid", type=str, default="", help="예: '4,8' 또는 '4x8'")
+    p.add_argument("--grid", type=str, default="4,2", help="예: '4,8' 또는 '4x8'")
     p.add_argument("--rows", type=int, default=0); p.add_argument("--cols", type=int, default=0)
     p.add_argument("--margin", type=float, default=0.03, help="그리드 외곽 여백")
     p.add_argument("--per_point", type=float, default=2.0, help="점당 응시 시간(초)")
@@ -882,7 +882,7 @@ def parse_args():
     p.add_argument("--patch_scale_w", type=float, default=2.5, help="half_w = max(s_u±)*scale")
     p.add_argument("--patch_scale_h", type=float, default=4.0, help="half_h = max(s_v±)*scale")
     p.add_argument("--patch_min_w_px", type=float, default=12.0, help="패치 half-width 최소 픽셀")
-    p.add_argument("--patch_min_h_px", type=float, default=30.0, help="패치 half-height 최소 픽셀")
+    p.add_argument("--patch_min_h_px", type=float, default=50.0, help="패치 half-height 최소 픽셀")
     p.add_argument("--patch_norm", type=str, default="z", choices=["z","none"])
     p.add_argument("--patch_clahe", action="store_true", default=True)
 
@@ -901,10 +901,11 @@ def main():
     screen = app.primaryScreen().geometry()
     sw, sh = screen.width(), screen.height()
     shared = SharedState(sw, sh)
-    overlay = OverlayWindow(shared, app)
-    panel = ControlPanel(shared)
+    
+    # 1) 먼저 인자 파싱
     args = parse_args()
-
+    
+    # 2) grid/rows/cols 파싱 및 shared 반영
     init_rows, init_cols = 0, 0
     if args.grid:
         m = re.match(r'^\s*(\d+)\s*[,xX]\s*(\d+)\s*$', args.grid)
@@ -919,8 +920,11 @@ def main():
         shared.ema_alpha = float(args.ema_a)
         shared.oe_mincutoff=float(args.oe_mincutoff); shared.oe_beta=float(args.oe_beta); shared.oe_dcutoff=float(args.oe_dcutoff)
 
+    # 3) 그 다음에 UI 생성
+    overlay = OverlayWindow(shared, app)
+    panel = ControlPanel(shared)
+    
     install_signal_handlers(shared, app)
-
     worker = GazeWorker(shared, args); worker.start()
     ret = app.exec_()
     worker.stop(); worker.join(timeout=1.0)
