@@ -193,7 +193,8 @@ class Calibrator:
                  feature_names=None):
         self.sw, self.sh = screen_w, screen_h
         self.rows, self.cols, self.margin = rows, cols, margin
-        self.points_norm = make_grid_points(rows, cols, margin, "serpentine") if (rows and cols) else FIVE_POINTS[:]
+        # self.points_norm = make_grid_points(rows, cols, margin, "serpentine") if (rows and cols) else FIVE_POINTS[:]
+        self.points_norm = make_grid_points(rows, cols, margin, "row_first") if (rows and cols) else FIVE_POINTS[:]
         self.per_point_sec = per_point_sec
         self.delay_sec = float(delay_sec)
         self.reset()
@@ -819,10 +820,10 @@ class GazeWorker(threading.Thread):
                             y0 = disp.shape[0] - th_h - pad
                             x0 = pad
                             disp[y0:y0+th_h, x0:x0+th_w] = thL
-                            cv2.rectangle(disp, (x0-1,y0-1), (x0+th_w, y0+th_h), (0,255,255), 1, cv2.LINE_AA)
+                            cv2.rectangle(disp, (x0-1, y0-1), (x0+th_w, y0+th_h), (0,255,0),   2, cv2.LINE_AA)  # 왼쪽=초록
                             x1 = x0 + th_w + pad
                             disp[y0:y0+th_h, x1:x1+th_w] = thR
-                            cv2.rectangle(disp, (x1-1,y0-1), (x1+th_w, y0+th_h), (0,255,255), 1, cv2.LINE_AA)
+                            cv2.rectangle(disp, (x1-1, y0-1), (x1+th_w, y0+th_h), (0,0,255),   2, cv2.LINE_AA)  # 오른쪽=빨강
 
                         cv2.imshow('MediaPipe Face Mesh', disp)
                         k=cv2.waitKey(1)&0xFF
@@ -882,7 +883,7 @@ def parse_args():
     p.add_argument("--patch_scale_w", type=float, default=2.5, help="half_w = max(s_u±)*scale")
     p.add_argument("--patch_scale_h", type=float, default=4.0, help="half_h = max(s_v±)*scale")
     p.add_argument("--patch_min_w_px", type=float, default=12.0, help="패치 half-width 최소 픽셀")
-    p.add_argument("--patch_min_h_px", type=float, default=50.0, help="패치 half-height 최소 픽셀")
+    p.add_argument("--patch_min_h_px", type=float, default=30.0, help="패치 half-height 최소 픽셀")
     p.add_argument("--patch_norm", type=str, default="z", choices=["z","none"])
     p.add_argument("--patch_clahe", action="store_true", default=True)
 
