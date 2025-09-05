@@ -351,6 +351,8 @@ class SharedState:
         self.patch_w = 50          # 패치 가로 해상도(px)
         self.patch_h = 50          # 패치 세로 해상도(px)
 
+        # 오버레이를 띄울 모니터 선택(기본: 주 모니터)
+        self.overlay_screen_idx = 0
 
         # 스무딩
         self.ema_alpha=0.8
@@ -378,6 +380,7 @@ class OverlayWindow(QtWidgets.QWidget):
         self.shared=shared; self.app=app
         self.status="Gaze Overlay"; self.substatus="Use Control Panel"
         self.cross=None; self.calib_target=None
+        self._cur_screen_idx = None  # 현재 오버레이가 붙어있는 스크린 인덱스
 
         flags = (QtCore.Qt.WindowStaysOnTopHint | QtCore.Qt.FramelessWindowHint |
                  QtCore.Qt.Tool | QtCore.Qt.WindowDoesNotAcceptFocus)
@@ -389,6 +392,7 @@ class OverlayWindow(QtWidgets.QWidget):
         self.setAttribute(QtCore.Qt.WA_ShowWithoutActivating, True)
         self.setFocusPolicy(QtCore.Qt.NoFocus)
 
+        # 초기에는 주 모니터로 시작(바로 아래 tick에서 선택 모니터로 이동 처리)
         self.setGeometry(self.app.primaryScreen().geometry())
         self.timer=QtCore.QTimer(self); self.timer.timeout.connect(self.tick); self.timer.start(16)
         self.show()
@@ -399,6 +403,21 @@ class OverlayWindow(QtWidgets.QWidget):
             self.calib_target=self.shared.calib_target
             enabled=self.shared.overlay_enabled
             self.status=self.shared.status; self.substatus=self.shared.substatus
+            want_idx = int(getattr(self.shared, "overlay_screen_idx", 0))
+
+        # 스크린 변경 처리: 선택된 모니터로 오버레이 이동 + shared.screen_w/h 동기화
+        try:
+            screens = self.app.screens()
+            if 0 <= want_idx < len(screens):
+                if self._cur_screen_idx != want_idx:
+                    g = screens[want_idx].geometry()
+                    self.setGeometry(g)
+                    with self.shared.lock:
+                        self.shared.screen_w = g.width()
+                        self.shared.screen_h = g.height()
+                    self._cur_screen_idx = want_idx
+        except Exception:
+            pass
 
         if enabled:
             if not self.isVisible(): self.setAttribute(QtCore.Qt.WA_ShowWithoutActivating, True); self.show()
@@ -418,7 +437,7 @@ class OverlayWindow(QtWidgets.QWidget):
             is_ready = bool(getattr(self.shared, 'calib_ready', False))
             has_target = (self.shared.calib_target is not None)
 
-        # ★ 개선: 타깃 표시 중인 "실제 캘리브 단계"에서만 검정 배경
+        # 타깃 표시 중인 "실제 캘리브 단계"에서만 검정 배경
         if is_calib and has_target:
             p.fillRect(self.rect(), QtGui.QColor(0, 0, 0, 255))
 
@@ -449,6 +468,30 @@ class ControlPanel(QtWidgets.QWidget):
         self.setFixedWidth(600)
 
         v = QtWidgets.QVBoxLayout(self)
+
+        # --- Overlay Monitor 선택 ---
+        grpMon = QtWidgets.QGroupBox("Overlay Display"); v.addWidget(grpMon)
+        gm = QtWidgets.QGridLayout(grpMon)
+        self.cmb_monitor = QtWidgets.QComboBox()
+        try:
+            screens = QtWidgets.QApplication.instance().screens()
+            for i, s in enumerate(screens):
+                g = s.geometry()
+                name = s.name() if hasattr(s, "name") else f"Screen-{i}"
+                self.cmb_monitor.addItem(f"{i}: {g.width()}x{g.height()} ({name})", i)
+        except Exception:
+            self.cmb_monitor.addItem("0: Primary", 0)
+        cur_idx = int(getattr(self.shared, "overlay_screen_idx", 0))
+        if 0 <= cur_idx < self.cmb_monitor.count():
+            self.cmb_monitor.setCurrentIndex(cur_idx)
+        gm.addWidget(QtWidgets.QLabel("Target/Overlay monitor"), 0, 0)
+        gm.addWidget(self.cmb_monitor,                          0, 1)
+        def _on_monitor_changed(_):
+            idx = int(self.cmb_monitor.currentData())
+            with self.shared.lock:
+                self.shared.overlay_screen_idx = idx
+            # OverlayWindow.tick()에서 setGeometry와 screen_w/h 동기화 수행
+        self.cmb_monitor.currentIndexChanged.connect(_on_monitor_changed)
 
         grpC = QtWidgets.QGroupBox("Calibration Grid"); v.addWidget(grpC)
         gc = QtWidgets.QGridLayout(grpC)
@@ -539,10 +582,7 @@ class ControlPanel(QtWidgets.QWidget):
         self.sb_ph.valueChanged.connect(
             lambda val: self._set("patch_h", int(val)))
 
-
-
-
-        # 바인딩
+        # (기존 중복 바인딩 유지)
         self.sb_h_from_w_ratio.valueChanged.connect(
             lambda val: self._set("patch_h_from_w_ratio", float(val)))
 
@@ -630,12 +670,14 @@ class GazeWorker(threading.Thread):
         # 초기 캘리브(실제 시작 시 다시 생성)
         self.calib=Calibrator(shared.screen_w, shared.screen_h, 0,0, args.margin, args.per_point, args.delay_time,
                               feature_names=self.feat_names)
+        self._last_screen_wh = (shared.screen_w, shared.screen_h)
 
     def _start_new_calibration(self):
         with self.shared.lock:
             rows=int(self.shared.calib_rows); cols=int(self.shared.calib_cols)
             perp=float(self.shared.calib_per_point); margin=float(self.shared.calib_margin); dsec=float(self.shared.calib_delay_sec)
-        self.calib = Calibrator(self.shared.screen_w, self.shared.screen_h, rows, cols, margin, perp, dsec,
+            sw = int(self.shared.screen_w); sh = int(self.shared.screen_h)
+        self.calib = Calibrator(sw, sh, rows, cols, margin, perp, dsec,
                                 feature_names=self.feat_names)
         self.calib.begin()
         if dsec >= perp:
@@ -656,13 +698,12 @@ class GazeWorker(threading.Thread):
             pb=(int(lms[b].x*W), int(lms[b].y*H))
             cv2.line(img, pa, pb, color, thickness, cv2.LINE_AA)
 
-
     def _build_fused_feature(self, frame_bgr, uL, vL, uR, vR,
                             cL, ax1L, ax2L, anisoL, su_visL, sv_visL, half_u_L, half_v_L,
                             cR, ax1R, ax2R, anisoR, su_visR, sv_visR, half_u_R, half_v_R):        
         """
         anisoX: (su_pos, su_neg, sv_pos, sv_neg)
-        ROI half-size는 max(side) 기반. (최소치 로직 삭제)
+        ROI half-size는 max(side) 기반.
         """
         f12 = _feat_vector_12d(uL, vL, uR, vR)
         if not self.use_patches:
@@ -675,7 +716,7 @@ class GazeWorker(threading.Thread):
         half_w_L = max(su_pL, su_nL) * self.patch_scale_w
         half_w_R = max(su_pR, su_nR) * self.patch_scale_w
 
-        # 세로 half-size는 “가로 half-size × 배율”로 정의 (최소/최대 비교 없음)
+        # 세로 half-size는 “가로 half-size × 배율”
         half_h_L = half_w_L * self.patch_h_from_w_ratio
         half_h_R = half_w_R * self.patch_h_from_w_ratio
 
@@ -725,6 +766,7 @@ class GazeWorker(threading.Thread):
                         psw            = float(self.shared.patch_scale_w)
                         new_pw         = int(self.shared.patch_w)
                         new_ph         = int(self.shared.patch_h)
+                        sw, sh         = int(self.shared.screen_w), int(self.shared.screen_h)
                         
                         # OneEuro 최신 파라미터
                         self.oe.mincutoff=float(self.args.oe_mincutoff)
@@ -746,9 +788,16 @@ class GazeWorker(threading.Thread):
                                 self._start_new_calibration()
                                 with self.shared.lock:
                                     self.shared.status = "Calibration restarted (patch size changed)"
-                                    self.shared.substatus = f"patch {self.patch_w}×{self.patch_h}"                        
-                            
-                        
+                                    self.shared.substatus = f"patch {self.patch_w}×{self.patch_h}"
+
+                    # 모니터(스크린) 변경 감지 → 수집 중이면 재시작(좌표계 혼동 방지)
+                    if self._last_screen_wh != (sw, sh):
+                        self._last_screen_wh = (sw, sh)
+                        if getattr(self.calib, "collecting", False):
+                            self._start_new_calibration()
+                            with self.shared.lock:
+                                self.shared.status = "Calibration restarted (monitor changed)"
+                                self.shared.substatus = f"{sw}x{sh}"
 
                     ok, frame = cap.read()
                     if not ok: continue
@@ -766,11 +815,9 @@ class GazeWorker(threading.Thread):
                         (uR, vR), icR, cR, ax1R, ax2R, suR_vis, svR_vis, duR, dvR, r_eye_pts, anisoR, half_u_R, half_v_R = _eye_uv_ex(
                             lms, RIGHT_EYE_ALL_IDXS, RIGHT_IRIS_IDXS, W, H)
 
-                        
                         gaze_feat, pL, triL, pR, triR = self._build_fused_feature(out, uL, vL, uR, vR,
                             cL, ax1L, ax2L, anisoL, suL_vis, svL_vis, half_u_L, half_v_L,
-                            cR, ax1R, ax2R, anisoR, suR_vis, svR_vis, half_u_R, half_v_R)                        
-                                                
+                            cR, ax1R, ax2R, anisoR, suR_vis, svR_vis, half_u_R, half_v_R)
 
                         if vis_mesh:
                             mp_drawing.draw_landmarks(out, res.multi_face_landmarks[0],
@@ -867,9 +914,7 @@ class GazeWorker(threading.Thread):
                             self.shared.cross=None
                         
                         if finished:
-                            _model_path = self.calib.save_model_pkl(self.patch_w, self.patch_h)                        
-                        
-                        
+                            _model_path = self.calib.save_model_pkl(self.patch_w, self.patch_h)
                             ds_path = self.calib.save_dataset_npz(DATA_DIR, {
                                 "rows": self.calib.rows, "cols": self.calib.cols, "margin": float(self.calib.margin),
                                 "per_point_sec": float(self.calib.per_point_sec), "delay_sec": float(self.calib.delay_sec),
@@ -877,7 +922,6 @@ class GazeWorker(threading.Thread):
                                 "mirror_preview": bool(self.args.mirror_preview),
                                 "use_patches": bool(self.use_patches), "patch_w": int(self.patch_w), "patch_h": int(self.patch_h),
                                 "patch_scale_w": float(self.patch_scale_w),
-                                
                                 "patch_norm": self.patch_norm or "none", "patch_clahe": bool(self.patch_clahe),
                                 "patch_h_from_w_ratio": float(self.patch_h_from_w_ratio)
                             })
@@ -885,10 +929,9 @@ class GazeWorker(threading.Thread):
                             with self.shared.lock:
                                 self.shared.calibrating=False
                                 self.shared.calib_target=None
-                                self.shared.calib_ready  = False                                
+                                self.shared.calib_ready  = False
                                 self.shared.status="Calibrated & saved data"
-                                self.shared.substatus=f"Model: {os.path.basename(_model_path)}  |  Data: {os.path.basename(ds_path)}"                                
-                                
+                                self.shared.substatus=f"Model: {os.path.basename(_model_path)}  |  Data: {os.path.basename(ds_path)}"
                                 
                     else:
                         px=None
@@ -1011,9 +1054,17 @@ def install_signal_handlers(shared: SharedState, app: QtWidgets.QApplication):
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
-    screen = app.primaryScreen().geometry() # 주 모니터 해상도
-    sw, sh = screen.width(), screen.height() # 주 모니터 크기(sw, sh)
-    shared = SharedState(sw, sh) # 저장
+    # 기본은 주 모니터 크기
+    primary = app.primaryScreen()
+    pg = primary.geometry()
+    sw, sh = pg.width(), pg.height()
+    shared = SharedState(sw, sh)
+    # 주 모니터 인덱스 기록
+    try:
+        screens = QtWidgets.QApplication.instance().screens()
+        shared.overlay_screen_idx = next((i for i,s in enumerate(screens) if s is primary), 0)
+    except Exception:
+        shared.overlay_screen_idx = 0
     
     # 1) 먼저 인자 파싱
     args = parse_args()
