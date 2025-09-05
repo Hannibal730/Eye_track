@@ -60,6 +60,13 @@ def _pca_axes_aniso(pts: np.ndarray):
     U, S, Vt = np.linalg.svd(X, full_matrices=False)
     ax1, ax2 = Vt[0], Vt[1]   # 단위벡터
 
+    # --- 축 부호 규약 강제: ax2는 아래(+y)로, 오른손좌표계 유지 ---
+    if ax2[1] < 0:              # ax2의 y성분이 음수면(=위쪽을 보면) 부호 뒤집기
+        ax2 = -ax2
+    # 오른손 좌표계(det>0) 유지: det([ax1 ax2]) < 0이면 ax1도 뒤집기
+    if (ax1[0]*ax2[1] - ax1[1]*ax2[0]) < 0:
+        ax1 = -ax1
+
     t1 = X @ ax1   # û축 투영 (s_i)
     t2 = X @ ax2   # v̂축 투영 (t_i)
 
@@ -188,12 +195,22 @@ class Ridge2D:
         self.alpha = alpha; self.W = None; self.b = None
     def fit(self, X, Y):
         X = np.asarray(X, dtype=np.float32); Y = np.asarray(Y, dtype=np.float32)
-        N, D = X.shape
-        Xb = np.hstack([X, np.ones((N,1), dtype=np.float32)])
-        I = np.eye(D+1, dtype=np.float32); I[-1,-1] = 0.0
-        A = Xb.T @ Xb + self.alpha * I
-        Wb = np.linalg.pinv(A) @ (Xb.T @ Y)
-        self.W = Wb[:-1,:].T; self.b = Wb[-1,:].T
+        # === Dual ridge with UN-regularized intercept (원래 방식과 수학적으로 동일) ===
+        # 1) 입력을 센터링
+        xmean = X.mean(axis=0, dtype=np.float32, keepdims=True)
+        ymean = Y.mean(axis=0, dtype=np.float32, keepdims=True)
+        Xc = X - xmean           # (N×D)
+        Yc = Y - ymean           # (N×2)
+        # 2) Dual을 N×N으로 풂
+        N = X.shape[0]
+        Kc = Xc @ Xc.T                                   # (N×N)
+        Z  = np.linalg.solve(Kc + self.alpha * np.eye(N, dtype=np.float32), Yc)   # (N×2)
+        W  = Xc.T @ Z                                    # (D×2) = 가중치(편향 제외)
+        # 3) 편향 복구: b = ȳ - x̄·w
+        b  = (ymean - xmean @ W).ravel()                 # (2,)
+        self.W = W.T.astype(np.float32)                  # (2×D)
+        self.b = b.astype(np.float32)                    # (2,)
+        
     def predict(self, X):
         X = np.asarray(X, dtype=np.float32)
         return (self.W @ X.T).T + self.b
@@ -1049,7 +1066,8 @@ class GazeWorker(threading.Thread):
                         if self.use_patches and self.shared.vis_patch_thumbs and (pL is not None) and (pR is not None):
                             th_h = 5*self.patch_h
                             th_w = 5*self.patch_w
-                            thL = cv2.resize(pL, (th_w, th_h), interpolation=cv2.INTER_NEAREST) 
+                            thL = cv2.resize(pL, (th_w, th_h), interpolation=cv2.INTER_NEAREST)
+                            thL = cv2.flip(thL, 1)  # ← 왼눈 썸네일만 좌우 보정(표시 전용) 
                             thR = cv2.resize(pR, (th_w, th_h), interpolation=cv2.INTER_NEAREST)
                             thR = cv2.flip(thR, 1)  # 표시용 보정(학습 입력에는 영향 없음)
                             pad = 8
