@@ -244,11 +244,18 @@ class Calibrator:
         x = int(np.clip(y[0], 0, self.sw - 1))
         yv= int(np.clip(y[1], 0, self.sh - 1))
         return x, yv
-    def save_model_pkl(self, path=None):
-        if path is None: path = os.path.join(MODELS_DIR, "calib_gaze.pkl")
-        with open(path, "wb") as f:
-            pickle.dump({"W": self.model.W, "b": self.model.b, "screen": (self.sw, self.sh),
-                         "feature_names": self.feature_names}, f)
+    
+    def save_model_pkl(self, patch_w:int, patch_h:int, path=None):
+        # 파일명: YYYYMMDD_HHMMSS_Grid{rows}x{cols}_Patch{pw}x{ph}.pkl
+        if path is None:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")  # 날짜만 원하면 %Y%m%d 로
+            fname = f"{ts}_Grid{int(self.rows)}x{int(self.cols)}_Patch{int(patch_w)}x{int(patch_h)}.pkl"
+            path = os.path.join(MODELS_DIR, fname)
+            with open(path, "wb") as f:
+                pickle.dump({"W": self.model.W, "b": self.model.b, "screen": (self.sw, self.sh),
+                            "feature_names": self.feature_names}, f)
+        return path            
+            
     def save_dataset_npz(self, out_dir=DATA_DIR, meta_extra=None):
         os.makedirs(out_dir, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -849,6 +856,7 @@ class GazeWorker(threading.Thread):
                         target_px = self.calib.current_target_px()
                         ready = (time.time() - self.calib.start_t) >= float(self.calib.delay_sec)
                         finished=False
+                        
                         if gaze_feat is not None: finished = self.calib.feed(gaze_feat, t_now=time.time())
                         with self.shared.lock:
                             self.shared.calibrating=True
@@ -857,8 +865,11 @@ class GazeWorker(threading.Thread):
                             self.shared.status=f"Calibration {self.calib.idx+1}/{self.calib.n_points()}"
                             self.shared.substatus="표시되는 원(고리)의 중심을 응시하세요"
                             self.shared.cross=None
+                        
                         if finished:
-                            self.calib.save_model_pkl()
+                            _model_path = self.calib.save_model_pkl(self.patch_w, self.patch_h)                        
+                        
+                        
                             ds_path = self.calib.save_dataset_npz(DATA_DIR, {
                                 "rows": self.calib.rows, "cols": self.calib.cols, "margin": float(self.calib.margin),
                                 "per_point_sec": float(self.calib.per_point_sec), "delay_sec": float(self.calib.delay_sec),
@@ -870,13 +881,15 @@ class GazeWorker(threading.Thread):
                                 "patch_norm": self.patch_norm or "none", "patch_clahe": bool(self.patch_clahe),
                                 "patch_h_from_w_ratio": float(self.patch_h_from_w_ratio)
                             })
-                            # ★ 끝난 즉시 검정 배경 해제되도록 상태 리셋
+                            # 끝난 즉시 검정 배경 해제되도록 상태 리셋
                             with self.shared.lock:
                                 self.shared.calibrating=False
                                 self.shared.calib_target=None
-                                self.shared.calib_ready  = False
+                                self.shared.calib_ready  = False                                
                                 self.shared.status="Calibrated & saved data"
-                                self.shared.substatus=f"Saved: {os.path.basename(ds_path)}"
+                                self.shared.substatus=f"Model: {os.path.basename(_model_path)}  |  Data: {os.path.basename(ds_path)}"                                
+                                
+                                
                     else:
                         px=None
                         if (gaze_feat is not None) and self.calib.has_model():
@@ -938,10 +951,10 @@ class GazeWorker(threading.Thread):
 # -------------------- 인자 --------------------
 def parse_args():
     p = argparse.ArgumentParser(description="MediaPipe FaceMesh + PyQt gaze overlay (12D + optional eye patches)")
-    p.add_argument("--grid", type=str, default="4,2", help="예: '4,8' 또는 '4x8'")
+    p.add_argument("--grid", type=str, default="6,4", help="예: '4,8' 또는 '4x8'")
     p.add_argument("--rows", type=int, default=0); p.add_argument("--cols", type=int, default=0)
     p.add_argument("--margin", type=float, default=0.03, help="그리드 외곽 여백")
-    p.add_argument("--per_point", type=float, default=2.0, help="점당 응시 시간(초)")
+    p.add_argument("--per_point", type=float, default=1.0, help="점당 응시 시간(초)")
     p.add_argument("--delay_time", type=float, default=0.5, help="포인트 이동 후 데이터 수집 지연(초)")
     p.add_argument("--camera", type=int, default=0, help="웹캠 인덱스")
     p.add_argument("--webcam_window", action="store_true", default=True)
@@ -949,11 +962,19 @@ def parse_args():
     p.add_argument("--mirror_preview", dest="mirror_preview", action="store_true")
     p.add_argument("--no-mirror_preview", dest="mirror_preview", action="store_false")
     p.set_defaults(mirror_preview=True)
-    p.add_argument("--ema_a", type=float, default=0.8)
-    p.add_argument("--oe_mincutoff", type=float, default=0.20)
-    p.add_argument("--oe_beta", type=float, default=0.003)
-    p.add_argument("--oe_dcutoff", type=float, default=1.0)
+    
+    p.add_argument("--ema_a", type=float, default=0.8,
+                   help="a가 클수록 과거값 가중치↑ → 더 부드러움(반응 느림) / a가 작을수록 새로운 값 반영↑ → 더 즉각적(노이즈↑)")
+    
+    p.add_argument("--oe_mincutoff", type=float, default=0.20,
+                   help="낮춤(0.10~0.20): 정지 시 오차가 잔잔, 대신 미세한 지연 / 높임(0.5~1.0): 바로바로 반응, 대신 잔 떨림이 보일 수 있음")
+    
+    p.add_argument("--oe_dcutoff", type=float, default=1.0,
+                   help="값이 클수록 속도 추정이 덜 평활(=더 민감) / 값이 작을수록 속도 추정이 안정적. 낮춤(0.5~1.0): 속도 추정이 안정 → 전체적으로 부드러움, 대신 급가속 감지는 둔감 / 높임(2.0~4.0): 속도 변화에 민감 → 반응↑, 대신 지터 위험↑")
 
+    p.add_argument("--oe_beta", type=float, default=0.003,
+                   help="움직일 때 컷오프를 얼마나 키울지를 정하는 계수. / 낮춤(0.001~0.003): 빠르게 움직일 때도 다소 매끈(근데 약간 뒤따름) / 높임(0.01~0.05): 휘리릭 따라감, 대신 움직임 중에 거친 느낌 가능")
+    
     # MediaPipe
     p.add_argument("--mp_min_det", type=float, default=0.75)
     p.add_argument("--mp_min_track", type=float, default=0.75)
