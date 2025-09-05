@@ -52,7 +52,7 @@ def _pca_axes_aniso(pts: np.ndarray):
     """
     PCA 축 계산 + 축 방향별(±) RMS 분리
     반환:
-      c, ax1, ax2, (su_pos, su_neg), (sv_pos, sv_neg), su_vis, sv_vis
+      c, ax1, ax2, (su_pos, su_neg), (sv_pos, sv_neg), su_vis, sv_vis, half_extent_u, half_extent_v
     """
     c = pts.mean(axis=0)
     X = pts - c
@@ -60,8 +60,8 @@ def _pca_axes_aniso(pts: np.ndarray):
     U, S, Vt = np.linalg.svd(X, full_matrices=False)
     ax1, ax2 = Vt[0], Vt[1]   # 단위벡터
 
-    t1 = X @ ax1
-    t2 = X @ ax2
+    t1 = X @ ax1   # û축 투영 (s_i)
+    t2 = X @ ax2   # v̂축 투영 (t_i)
 
     def _rms(a):
         a = np.asarray(a, dtype=np.float32)
@@ -77,13 +77,17 @@ def _pca_axes_aniso(pts: np.ndarray):
     # 시각화/기본 길이용(보수적으로 더 큰 쪽)
     su_vis = max(su_pos, su_neg)
     sv_vis = max(sv_pos, sv_neg)
-    
-    # 컨투어 half-extent (outlier 억제 원하면 percentile로 대체 가능)
-    u_extent = float(max(abs(t1.min()), abs(t1.max())))
-    v_extent = float(max(abs(t2.min()), abs(t2.max())))
 
-    # ★ 반환값 뒤에 u_extent, v_extent 추가
-    return c, ax1, ax2, (su_pos, su_neg), (sv_pos, sv_neg), su_vis, sv_vis, u_extent, v_extent    
+    # 축별 half-extent (양/음쪽 최대 거리의 큰 쪽). 노이즈가 심하면 percentile로 바꿔도 됨.
+    hu_pos = float(np.max(t1[t1 >= 0]) if np.any(t1 >= 0) else 1e-6)
+    hu_neg = float(np.max(-t1[t1 < 0]) if np.any(t1 < 0) else 1e-6)
+    hv_pos = float(np.max(t2[t2 >= 0]) if np.any(t2 >= 0) else 1e-6)
+    hv_neg = float(np.max(-t2[t2 < 0]) if np.any(t2 < 0) else 1e-6)
+    half_extent_u = max(hu_pos, hu_neg)
+    half_extent_v = max(hv_pos, hv_neg)
+    return c, ax1, ax2, (su_pos, su_neg), (sv_pos, sv_neg), su_vis, sv_vis, half_extent_u, half_extent_v
+
+
 
 def _iris_center(landmarks, idxs, W, H):
     pts = np.array([(landmarks[i].x * W, landmarks[i].y * H) for i in idxs], dtype=np.float32)
@@ -97,7 +101,7 @@ def _eye_uv_ex(landmarks, eye_idxs, iris_idxs, W, H):
     또한 su_vis, sv_vis(큰 쪽)도 함께 반환(시각화·ROI 기본길이용)
     """
     eye_pts = np.array([(landmarks[i].x * W, landmarks[i].y * H) for i in eye_idxs], dtype=np.float32)
-    c, ax1, ax2, (su_p, su_n), (sv_p, sv_n), su_vis, sv_vis, u_extent, v_extent = _pca_axes_aniso(eye_pts)
+    c, ax1, ax2, (su_p, su_n), (sv_p, sv_n), su_vis, sv_vis, half_extent_u, half_extent_v = _pca_axes_aniso(eye_pts)
     ic = _iris_center(landmarks, iris_idxs, W, H)
     delta = ic - c
     du = float(np.dot(delta, ax1))   # px
@@ -113,7 +117,7 @@ def _eye_uv_ex(landmarks, eye_idxs, iris_idxs, W, H):
     v = float(dv / sv_used)
 
     aniso = (su_p, su_n, sv_p, sv_n)
-    return (u, v), ic, c, ax1, ax2, su_vis, sv_vis, du, dv, eye_pts, aniso, u_extent, v_extent
+    return (u, v), ic, c, ax1, ax2, su_vis, sv_vis, du, dv, eye_pts, aniso, half_extent_u, half_extent_v
 
 def _feat_vector_12d(uL, vL, uR, vR):
     return np.array([
@@ -332,6 +336,10 @@ class SharedState:
         # 패치 시각화 (기본 ON으로 변경)
         self.vis_eye_patch_boxes   = True
         self.vis_patch_thumbs      = True
+        
+        # 패치 크기 비율(UI에서 조절)
+        # (최소치 제거 → 가로/세로 비율만 유지)
+        self.patch_h_from_w_ratio = 1.0
 
         # 스무딩
         self.ema_alpha=0.8
@@ -487,6 +495,19 @@ class ControlPanel(QtWidgets.QWidget):
         gl.addWidget(self.cb_cnt_pts,    5,0); gl.addWidget(self.cb_cnt_edges,  5,1)
         gl.addWidget(self.cb_patch_boxes,6,0); gl.addWidget(self.cb_patch_th,   6,1)
 
+        # --- patch sizing ---
+        grpP = QtWidgets.QGroupBox("Patch sizing"); v.addWidget(grpP)
+        gp = QtWidgets.QGridLayout(grpP)
+        # (최소치 제거 → Min width ratio UI 삭제, 세로/가로 배율만 유지)
+        self.sb_h_from_w_ratio = QtWidgets.QDoubleSpinBox(); self.sb_h_from_w_ratio.setRange(0.10, 200.00)
+        self.sb_h_from_w_ratio.setDecimals(3); self.sb_h_from_w_ratio.setSingleStep(0.1)
+        self.sb_h_from_w_ratio.setValue(self.shared.patch_h_from_w_ratio)
+        gp.addWidget(QtWidgets.QLabel("Height = Width ×"),     0, 0)
+        gp.addWidget(self.sb_h_from_w_ratio,                   0, 1)
+        # 바인딩
+        self.sb_h_from_w_ratio.valueChanged.connect(
+            lambda val: self._set("patch_h_from_w_ratio", float(val)))
+
         grp2 = QtWidgets.QGroupBox("Smoothing Factors"); v.addWidget(grp2)
         g2 = QtWidgets.QGridLayout(grp2)
         g2.addWidget(QtWidgets.QLabel("OneEuro mincutoff"), 0,0)
@@ -558,11 +579,13 @@ class GazeWorker(threading.Thread):
         self.use_patches = bool(args.use_patches)
         self.patch_w = int(args.patch_w); self.patch_h = int(args.patch_h)
         self.patch_scale_w = float(args.patch_scale_w)
-        self.patch_scale_h = float(args.patch_scale_h)
-        self.patch_min_w_px = float(args.patch_min_w_px)
-        self.patch_min_h_px = float(args.patch_min_h_px)
+
+        # (최소치 제거) self.patch_min_w_ratio 등은 사용하지 않음
         self.patch_norm = "z" if args.patch_norm == "z" else None
         self.patch_clahe = bool(args.patch_clahe)
+        
+        # 세로=가로×배율
+        self.patch_h_from_w_ratio= float(args.patch_h_from_w_ratio)
 
         self.feat_names = _build_feature_names(self.use_patches, self.patch_w, self.patch_h)
 
@@ -595,23 +618,28 @@ class GazeWorker(threading.Thread):
             pb=(int(lms[b].x*W), int(lms[b].y*H))
             cv2.line(img, pa, pb, color, thickness, cv2.LINE_AA)
 
+
     def _build_fused_feature(self, frame_bgr, uL, vL, uR, vR,
-                            cL, ax1L, ax2L, anisoL, su_visL, sv_visL, uExtL, vExtL,
-                            cR, ax1R, ax2R, anisoR, su_visR, sv_visR, uExtR, vExtR):
+                            cL, ax1L, ax2L, anisoL, su_visL, sv_visL, half_u_L, half_v_L,
+                            cR, ax1R, ax2R, anisoR, su_visR, sv_visR, half_u_R, half_v_R):        
         """
         anisoX: (su_pos, su_neg, sv_pos, sv_neg)
-        ROI half-size는 max(side) 기반 + 최소 픽셀 바닥값 적용
+        ROI half-size는 max(side) 기반. (최소치 로직 삭제)
         """
         f12 = _feat_vector_12d(uL, vL, uR, vR)
         if not self.use_patches:
             return f12, None, None, None, None
 
-        # ★ 동적 비율: 컨투어 half-extent(û: uExt*, v̂: vExt*) × 스케일
-        #    patch_scale_w/h를 "컨투어 대비 여유 배율"로 사용(1.0 → 딱 맞춤, 1.2 → 20% 크게)
-        half_w_L = max(self.patch_scale_w * uExtL, 1.0)  # 1.0은 0 분모 방지용 미니마 안전장치
-        half_h_L = max(self.patch_scale_h * vExtL, 1.0)
-        half_w_R = max(self.patch_scale_w * uExtR, 1.0)
-        half_h_R = max(self.patch_scale_h * vExtR, 1.0)
+        su_pL, su_nL, sv_pL, sv_nL = anisoL
+        su_pR, su_nR, sv_pR, sv_nR = anisoR
+
+        # 스케일 기반 half-size (RMS × scale)
+        half_w_L = max(su_pL, su_nL) * self.patch_scale_w
+        half_w_R = max(su_pR, su_nR) * self.patch_scale_w
+
+        # 세로 half-size는 “가로 half-size × 배율”로 정의 (최소/최대 비교 없음)
+        half_h_L = half_w_L * self.patch_h_from_w_ratio
+        half_h_R = half_w_R * self.patch_h_from_w_ratio
 
         pL, triL = _warp_oriented_patch(frame_bgr, cL, ax1L, ax2L, half_w_L, half_h_L, self.patch_w, self.patch_h)
         pR, triR = _warp_oriented_patch(frame_bgr, cR, ax1R, ax2R, half_w_R, half_h_R, self.patch_w, self.patch_h)
@@ -655,10 +683,16 @@ class GazeWorker(threading.Thread):
                         vis_patch_boxes= self.shared.vis_eye_patch_boxes
                         vis_patch_th   = self.shared.vis_patch_thumbs
                         ema_a          = float(self.shared.ema_alpha)
+                        # (최소치 제거) min width ratio 관련 공유값/갱신 제거
+                        h_from_w_ratio = float(self.shared.patch_h_from_w_ratio)
+                        
                         # OneEuro 최신 파라미터
                         self.oe.mincutoff=float(self.args.oe_mincutoff)
                         self.oe.beta     =float(self.args.oe_beta)
                         self.oe.dcutoff  =float(self.args.oe_dcutoff)
+                        
+                        # 세로/가로 배율 업데이트
+                        self.patch_h_from_w_ratio = h_from_w_ratio
 
                     ok, frame = cap.read()
                     if not ok: continue
@@ -671,16 +705,16 @@ class GazeWorker(threading.Thread):
 
                     if res.multi_face_landmarks:
                         lms = res.multi_face_landmarks[0].landmark
-                        (uL, vL), icL, cL, ax1L, ax2L, suL_vis, svL_vis, duL, dvL, l_eye_pts, anisoL, uExtL, vExtL = _eye_uv_ex(
+                        (uL, vL), icL, cL, ax1L, ax2L, suL_vis, svL_vis, duL, dvL, l_eye_pts, anisoL, half_u_L, half_v_L = _eye_uv_ex(
                             lms, LEFT_EYE_ALL_IDXS,  LEFT_IRIS_IDXS,  W, H)
-                        (uR, vR), icR, cR, ax1R, ax2R, suR_vis, svR_vis, duR, dvR, r_eye_pts, anisoR, uExtR, vExtR = _eye_uv_ex(
+                        (uR, vR), icR, cR, ax1R, ax2R, suR_vis, svR_vis, duR, dvR, r_eye_pts, anisoR, half_u_R, half_v_R = _eye_uv_ex(
                             lms, RIGHT_EYE_ALL_IDXS, RIGHT_IRIS_IDXS, W, H)
 
-                        gaze_feat, pL, triL, pR, triR = self._build_fused_feature(
-                            out, uL, vL, uR, vR,
-                            cL, ax1L, ax2L, anisoL, suL_vis, svL_vis, uExtL, vExtL,
-                            cR, ax1R, ax2R, anisoR, suR_vis, svR_vis, uExtR, vExtR
-                        )
+                        
+                        gaze_feat, pL, triL, pR, triR = self._build_fused_feature(out, uL, vL, uR, vR,
+                            cL, ax1L, ax2L, anisoL, suL_vis, svL_vis, half_u_L, half_v_L,
+                            cR, ax1R, ax2R, anisoR, suR_vis, svR_vis, half_u_R, half_v_R)                        
+                                                
 
                         if vis_mesh:
                             mp_drawing.draw_landmarks(out, res.multi_face_landmarks[0],
@@ -782,9 +816,10 @@ class GazeWorker(threading.Thread):
                                 "camera_index": int(self.args.camera),
                                 "mirror_preview": bool(self.args.mirror_preview),
                                 "use_patches": bool(self.use_patches), "patch_w": int(self.patch_w), "patch_h": int(self.patch_h),
-                                "patch_scale_w": float(self.patch_scale_w), "patch_scale_h": float(self.patch_scale_h),
-                                "patch_min_w_px": float(self.patch_min_w_px), "patch_min_h_px": float(self.patch_min_h_px),
-                                "patch_norm": self.patch_norm or "none", "patch_clahe": bool(self.patch_clahe)
+                                "patch_scale_w": float(self.patch_scale_w),
+                                
+                                "patch_norm": self.patch_norm or "none", "patch_clahe": bool(self.patch_clahe),
+                                "patch_h_from_w_ratio": float(self.patch_h_from_w_ratio)
                             })
                             # ★ 끝난 즉시 검정 배경 해제되도록 상태 리셋
                             with self.shared.lock:
@@ -883,12 +918,14 @@ def parse_args():
 
     # 패치 피처 옵션
     p.add_argument("--use_patches", action="store_true", default=True)
-    p.add_argument("--patch_w", type=int, default=50, help="패치 가로(px)")
-    p.add_argument("--patch_h", type=int, default=50, help="패치 세로(px)")
+    p.add_argument("--patch_w", type=int, default=50, help="training 패치 가로(px)")
+    p.add_argument("--patch_h", type=int, default=50, help="training 패치 세로(px)")
     p.add_argument("--patch_scale_w", type=float, default=2.5, help="half_w = max(s_u±)*scale")
-    p.add_argument("--patch_scale_h", type=float, default=4.0, help="half_h = max(s_v±)*scale")
-    p.add_argument("--patch_min_w_px", type=float, default=12.0, help="패치 half-width 최소 픽셀")
-    p.add_argument("--patch_min_h_px", type=float, default=30.0, help="패치 half-height 최소 픽셀")
+
+    # 세로/가로 배율만 유지
+    p.add_argument("--patch_h_from_w_ratio", type=float, default=1.0,
+                help="세로 half-size = 가로 half-size × 이 배율")    
+        
     p.add_argument("--patch_norm", type=str, default="z", choices=["z","none"])
     p.add_argument("--patch_clahe", action="store_true", default=True)
 
