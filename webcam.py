@@ -475,7 +475,7 @@ class ControlPanel(QtWidgets.QWidget):
         v = QtWidgets.QVBoxLayout(self)
 
         # --- Overlay Monitor 선택 ---
-        grpMon = QtWidgets.QGroupBox("Overlay Display"); v.addWidget(grpMon)
+        grpMon = QtWidgets.QGroupBox("Display Settings"); v.addWidget(grpMon)
         gm = QtWidgets.QGridLayout(grpMon)
         self.cmb_monitor = QtWidgets.QComboBox()
         try:
@@ -498,9 +498,9 @@ class ControlPanel(QtWidgets.QWidget):
             # OverlayWindow.tick()에서 setGeometry와 screen_w/h 동기화 수행
         self.cmb_monitor.currentIndexChanged.connect(_on_monitor_changed)
 
-        # --- ▶ 추가: Webcam 선택(모니터 선택 바로 아래) ---
+        # --- Webcam 선택(모니터 선택 바로 아래) ---
         self.cmb_cam = QtWidgets.QComboBox()
-        self.btn_cam_refresh = QtWidgets.QPushButton("Refresh")
+
 
         def _probe_cameras(max_idx=10):
             found = []
@@ -548,13 +548,11 @@ class ControlPanel(QtWidgets.QWidget):
                 self.shared.substatus = ""
                 self.shared.cmd["switch_camera"] = True
 
-        self.btn_cam_refresh.clicked.connect(_fill_cam_list)
         self.cmb_cam.currentIndexChanged.connect(_on_cam_changed)
 
         _fill_cam_list()
         gm.addWidget(QtWidgets.QLabel("Webcam"), 1, 0)
         gm.addWidget(self.cmb_cam,               1, 1)
-        gm.addWidget(self.btn_cam_refresh,       1, 2)
 
         grpC = QtWidgets.QGroupBox("Calibration Grid"); v.addWidget(grpC)
         gc = QtWidgets.QGridLayout(grpC)
