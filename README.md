@@ -1,9 +1,9 @@
 ![Visitor Badge](https://visitor-badge.laobi.icu/badge?page_id=Hannibal730.Webcam-Eye-Tracker)
 
-# Webcam Eye Tracker (MediaPipe + Ridge)
+# Webcam Eye Tracker
 
 
-<img src="https://github.com/user-attachments/assets/3887fa4d-d510-4004-95ab-91bf04c8b868" width="1000" alt="predict Example" />
+<img src="https://github.com/user-attachments/assets/3887fa4d-d510-4004-95ab-91bf04c8b868" width="800" alt="predict Example" />
 
 ---
 
@@ -97,6 +97,35 @@ python main.py
 
 * **OneEuro mincutoff / beta / dcutoff** — jitter vs. responsiveness trade-off.
 * **EMA α** — exponential moving average weight (higher = smoother, slower).
+
+---
+
+### Calibration Guide
+
+<img src="https://github.com/user-attachments/assets/bad50395-3ef6-4ed3-b154-20dcd180fa58" width="500" alt="predict Example" />
+
+1. **Pick devices**
+   In the Control Panel, choose the **Target/Overlay monitor** and **Webcam**.
+
+2. **Set grid & timing**
+
+   * **Rows / Columns**: target layout (serpentine order).
+   * **Per-point (sec)**: how long to dwell on each target.
+   * **Delay (sec)**: wait time after the target moves **before** sampling starts.
+
+3. **Start**
+   Click **Start Calibration**. An orange **ring** appears on a black screen. After the delay, it turns into a **filled dot**—that’s when data is collected. Keep your eyes on the dot until it jumps to the next location.
+
+4. **Finish**
+   After the last point, the model is trained and saved automatically (e.g., `YYYYMMDD_HHMMSS_Grid{R}x{C}_Patch{W}x{H}.pkl`). The overlay switches to a **red dot** showing live gaze.
+
+5. **Controls**
+
+   * **Stop Calibration**: aborts the sequence.
+   * **Keyboard (preview window)**: `c` start, `s` stop, `o` overlay toggle, `q`/`ESC` quit.
+
+**Tips:** keep `Delay < Per-point`, hold head steady, ensure even lighting, and avoid moving windows between monitors during calibration.
+
 
 ---
 
