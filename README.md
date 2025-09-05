@@ -1,4 +1,4 @@
-![Visitor Badge](https://visitor-badge.laobi.icu/badge?page_id=Hannibal730.Eye_track)
+![Visitor Badge](https://visitor-badge.laobi.icu/badge?page_id=Hannibal730.Webcam-Eye-Tracker)
 
 # Webcam Eye Tracker (MediaPipe + Ridge)
 
