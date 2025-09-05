@@ -347,7 +347,7 @@ class SharedState:
         # 패치 크기 비율(UI에서 조절)
         # 가로/세로 비율만 유지
         self.patch_h_from_w_ratio = 1.0
-        self.patch_scale_w = 2.5   # half_w = max(s_u±)*scale
+        self.patch_scale_w = 2.0   # half_w = max(s_u±)*scale
         self.patch_w = 50          # 패치 가로 해상도(px)
         self.patch_h = 50          # 패치 세로 해상도(px)
 
@@ -1087,10 +1087,10 @@ class GazeWorker(threading.Thread):
 # -------------------- 인자 --------------------
 def parse_args():
     p = argparse.ArgumentParser(description="MediaPipe FaceMesh + PyQt gaze overlay (12D + optional eye patches)")
-    p.add_argument("--grid", type=str, default="6,4", help="예: '4,8' 또는 '4x8'")
+    p.add_argument("--grid", type=str, default="6,3", help="예: '4,8' 또는 '4x8'")
     p.add_argument("--rows", type=int, default=0); p.add_argument("--cols", type=int, default=0)
     p.add_argument("--margin", type=float, default=0.03, help="그리드 외곽 여백")
-    p.add_argument("--per_point", type=float, default=1.0, help="점당 응시 시간(초)")
+    p.add_argument("--per_point", type=float, default=0.7, help="점당 응시 시간(초)")
     p.add_argument("--delay_time", type=float, default=0.5, help="포인트 이동 후 데이터 수집 지연(초)")
     p.add_argument("--camera", type=int, default=0, help="웹캠 인덱스")
     p.add_argument("--webcam_window", action="store_true", default=True)
@@ -1126,9 +1126,7 @@ def parse_args():
     p.add_argument("--use_patches", action="store_true", default=True)
     p.add_argument("--patch_w", type=int, default=50, help="training 패치 가로(px)")
     p.add_argument("--patch_h", type=int, default=50, help="training 패치 세로(px)")
-    p.add_argument("--patch_scale_w", type=float, default=2.5, help="half_w = max(s_u±)*scale")
-
-    # 세로/가로 배율만 유지
+    p.add_argument("--patch_scale_w", type=float, default=2.0, help="half_w = max(s_u±)*scale")
     p.add_argument("--patch_h_from_w_ratio", type=float, default=1.0,
                 help="세로 half-size = 가로 half-size × 이 배율")    
         
