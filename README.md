@@ -5,11 +5,14 @@
 
 <img src="https://github.com/user-attachments/assets/3887fa4d-d510-4004-95ab-91bf04c8b868" width="800" alt="predict Example" />
 
+[Youtube Link](https://youtu.be/Z9MyU2C8ZpM)
+
 ---
 
 Low-cost eye tracking on a **standard webcam** with **simple calibration**, **monitor & camera selection**, and a transparent on-screen overlay. Built on Google **MediaPipe Face Mesh** with a compact, mathematically grounded pipeline (**eye-contour PCA → per-axis normalization → ridge regression**) for real-time inference.
 
 > **Purpose:** make eye-based communication more accessible for people with limited mobility—using only a lower cost home webcam.
+
 
 ---
 
@@ -137,7 +140,6 @@ Using **MediaPipe Face Mesh**, we read dense facial landmarks, including iris po
 For each eye we gather contour points $\{x_i\in\mathbb{R}^2\}$.
 
 <br>
-<br>
 
 ### 2) Eye Axes via PCA (SVD)
 
@@ -153,7 +155,6 @@ To avoid visual flips when head pitch changes, we fix a **sign convention** per 
 
 This makes patch warping and thumbnails temporally stable.
 
-<br>
 <br>
 
 ### 3) Anisotropic Per-Axis Normalization
@@ -173,7 +174,7 @@ $$
 
 where $t_1 = (x_i-c)\cdot\hat u$, $t_2 = (x_i-c)\cdot\hat v$.
 
-We then normalize **piecewise** (fixed the “? typo”):
+We then normalize **piecewise**
 
 $$
 \Delta u = (p-c)\cdot \hat u,\quad \Delta v = (p-c)\cdot \hat v
@@ -196,7 +197,6 @@ $$
 This captures eyelid asymmetry and improves vertical sensitivity.
 
 <br>
-<br>
 
 ### 4) Oriented Eye Patches (optional)
 
@@ -208,7 +208,6 @@ We crop an **oriented ROI** around each eye using the axes:
 We build an oriented rectangle from $(c,\hat u,\hat v,\text{half}_w,\text{half}_h)$ and **affine-warp** it to a fixed grid of size `patch_w × patch_h`.
 Preprocessing: **grayscale → CLAHE → flatten → z-normalize** to a 1-D vector.
 
-<br>
 <br>
 
 ### 5) Feature Fusion
@@ -229,7 +228,6 @@ $$
 
 This matches a **primal ridge with no penalty on $b$** but runs fast even when the feature dimension is large.
 
-<br>
 <br>
 
 ### 7) Smoothing
