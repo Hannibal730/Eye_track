@@ -60,8 +60,8 @@ def _pca_axes_aniso(pts: np.ndarray):
     U, S, Vt = np.linalg.svd(X, full_matrices=False)
     ax1, ax2 = Vt[0], Vt[1]   # 단위벡터
 
-    t1 = X @ ax1
-    t2 = X @ ax2
+    t1 = X @ ax1   # û축 투영 (s_i)
+    t2 = X @ ax2   # v̂축 투영 (t_i)
 
     def _rms(a):
         a = np.asarray(a, dtype=np.float32)
