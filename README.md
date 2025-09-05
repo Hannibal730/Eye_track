@@ -1,6 +1,6 @@
 ![Visitor Badge](https://visitor-badge.laobi.icu/badge?page_id=Hannibal730.Webcam-Eye-Tracker)
 
-# Webcam Eye Tracker
+# Webcam Eye-gazing point Tracker
 
 
 <img src="https://github.com/user-attachments/assets/3887fa4d-d510-4004-95ab-91bf04c8b868" width="800" alt="predict Example" />
