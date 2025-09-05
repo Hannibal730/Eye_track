@@ -338,8 +338,12 @@ class SharedState:
         self.vis_patch_thumbs      = True
         
         # 패치 크기 비율(UI에서 조절)
-        # (최소치 제거 → 가로/세로 비율만 유지)
+        # 가로/세로 비율만 유지
         self.patch_h_from_w_ratio = 1.0
+        self.patch_scale_w = 2.5   # half_w = max(s_u±)*scale
+        self.patch_w = 50          # 패치 가로 해상도(px)
+        self.patch_h = 50          # 패치 세로 해상도(px)
+
 
         # 스무딩
         self.ema_alpha=0.8
@@ -498,12 +502,39 @@ class ControlPanel(QtWidgets.QWidget):
         # --- patch sizing ---
         grpP = QtWidgets.QGroupBox("Patch sizing"); v.addWidget(grpP)
         gp = QtWidgets.QGridLayout(grpP)
-        # (최소치 제거 → Min width ratio UI 삭제, 세로/가로 배율만 유지)
         self.sb_h_from_w_ratio = QtWidgets.QDoubleSpinBox(); self.sb_h_from_w_ratio.setRange(0.10, 200.00)
         self.sb_h_from_w_ratio.setDecimals(3); self.sb_h_from_w_ratio.setSingleStep(0.1)
         self.sb_h_from_w_ratio.setValue(self.shared.patch_h_from_w_ratio)
-        gp.addWidget(QtWidgets.QLabel("Height = Width ×"),     0, 0)
-        gp.addWidget(self.sb_h_from_w_ratio,                   0, 1)
+
+        self.sb_scale_w = QtWidgets.QDoubleSpinBox(); self.sb_scale_w.setRange(0.10, 200.00)
+        self.sb_scale_w.setDecimals(2); self.sb_scale_w.setSingleStep(0.05)
+        self.sb_scale_w.setValue(self.shared.patch_scale_w)
+        self.sb_pw = QtWidgets.QSpinBox(); self.sb_pw.setRange(8, 256); self.sb_pw.setSingleStep(1)
+        self.sb_pw.setValue(self.shared.patch_w)
+        self.sb_ph = QtWidgets.QSpinBox(); self.sb_ph.setRange(8, 256); self.sb_ph.setSingleStep(1)
+        self.sb_ph.setValue(self.shared.patch_h)
+        gp.addWidget(QtWidgets.QLabel("Height = Width ×"), 0, 0)
+        gp.addWidget(self.sb_h_from_w_ratio,               0, 1)
+        gp.addWidget(QtWidgets.QLabel("Width scale (û RMS → half_w)"), 1, 0)
+        gp.addWidget(self.sb_scale_w,                                   1, 1)
+        gp.addWidget(QtWidgets.QLabel("Patch width (px)"),  2, 0)
+        gp.addWidget(self.sb_pw,                            2, 1)
+        gp.addWidget(QtWidgets.QLabel("Patch height (px)"), 3, 0)
+        gp.addWidget(self.sb_ph,                            3, 1)
+        
+        # 바인딩
+        self.sb_h_from_w_ratio.valueChanged.connect(
+                lambda val: self._set("patch_h_from_w_ratio", float(val)))
+        self.sb_scale_w.valueChanged.connect(
+            lambda val: self._set("patch_scale_w", float(val)))
+        self.sb_pw.valueChanged.connect(
+            lambda val: self._set("patch_w", int(val)))
+        self.sb_ph.valueChanged.connect(
+            lambda val: self._set("patch_h", int(val)))
+
+
+
+
         # 바인딩
         self.sb_h_from_w_ratio.valueChanged.connect(
             lambda val: self._set("patch_h_from_w_ratio", float(val)))
@@ -683,8 +714,10 @@ class GazeWorker(threading.Thread):
                         vis_patch_boxes= self.shared.vis_eye_patch_boxes
                         vis_patch_th   = self.shared.vis_patch_thumbs
                         ema_a          = float(self.shared.ema_alpha)
-                        # (최소치 제거) min width ratio 관련 공유값/갱신 제거
                         h_from_w_ratio = float(self.shared.patch_h_from_w_ratio)
+                        psw            = float(self.shared.patch_scale_w)
+                        new_pw         = int(self.shared.patch_w)
+                        new_ph         = int(self.shared.patch_h)
                         
                         # OneEuro 최신 파라미터
                         self.oe.mincutoff=float(self.args.oe_mincutoff)
@@ -693,6 +726,22 @@ class GazeWorker(threading.Thread):
                         
                         # 세로/가로 배율 업데이트
                         self.patch_h_from_w_ratio = h_from_w_ratio
+                        # 가로 스케일 실시간 반영
+                        self.patch_scale_w = psw
+
+                        # 패치 해상도 변경시: 피처 차원 달라지므로 안전하게 갱신
+                        dims_changed = (new_pw != self.patch_w) or (new_ph != self.patch_h)
+                        if dims_changed:
+                            self.patch_w, self.patch_h = new_pw, new_ph
+                            self.feat_names = _build_feature_names(self.use_patches, self.patch_w, self.patch_h)
+                            # 수집 중이면 재시작하여 차원 불일치 방지
+                            if getattr(self.calib, "collecting", False):
+                                self._start_new_calibration()
+                                with self.shared.lock:
+                                    self.shared.status = "Calibration restarted (patch size changed)"
+                                    self.shared.substatus = f"patch {self.patch_w}×{self.patch_h}"                        
+                            
+                        
 
                     ok, frame = cap.read()
                     if not ok: continue
@@ -962,6 +1011,10 @@ def main():
         shared.calib_per_point = float(args.per_point); shared.calib_delay_sec = float(args.delay_time); shared.calib_margin = float(args.margin)
         shared.ema_alpha = float(args.ema_a)
         shared.oe_mincutoff=float(args.oe_mincutoff); shared.oe_beta=float(args.oe_beta); shared.oe_dcutoff=float(args.oe_dcutoff)
+        shared.patch_h_from_w_ratio = float(args.patch_h_from_w_ratio)
+        shared.patch_scale_w = float(args.patch_scale_w)
+        shared.patch_w = int(args.patch_w)
+        shared.patch_h = int(args.patch_h)
 
     # 3) 그 다음에 UI 생성
     overlay = OverlayWindow(shared, app)
